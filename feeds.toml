@@ -1,0 +1,10 @@
+# Device sources, merged over the base feeds.toml by "unixnu fetch".
+
+# The pinned 2023 crypto provider the source-crypto kernel configuration links
+# (built by the base scripts/build-corecrypto-14.py; only the pinned revision is trusted).
+[[source]]
+name = "corecrypto-2023"
+kind = "refer"
+git = "https://github.com/ONLYA/corecrypto-2023"
+ref = "main"
+commit = "11fba65b12d8830630e248dfa8344caf8b065f26"
