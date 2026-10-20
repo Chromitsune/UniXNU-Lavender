@@ -19,10 +19,20 @@ CONFIG_XNU_SOURCE_MOCKFS=y
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 CONFIG_XNU_VERIFIED_ROOT_PROBE=y
 CONFIG_XNU_OWNER_ROOT_AUDIT=y
-# OWNER_ROOT_TRUST off for first boot: the build gate requires a verified
-# native block driver (sheng pairs it with VirtioBlock; our NativeEmmc does
-# not exist yet). Audit + probe stay on; flip trust on with the eMMC driver.
+# Owner boot ladders OFF for first boot: each rung requires OWNER_ROOT_TRUST=1
+# (cache-mount -> cache-startup -> boot-manifest -> data-mount -> union-SystemOS),
+# and TRUST itself demands a verified native block driver (sheng pairs it with
+# VirtioBlock; our NativeEmmc does not exist yet). Audit + probe stay on; the
+# ladder comes back with the eMMC driver.
 CONFIG_XNU_OWNER_ROOT_TRUST=n
+CONFIG_XNU_OWNER_CACHE_MOUNT=n
+CONFIG_XNU_OWNER_CACHE_STARTUP=n
+CONFIG_XNU_OWNER_BOOT_MANIFEST=n
+CONFIG_XNU_OWNER_DATA_MOUNT=n
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=n
+# Boot-progress telemetry also rides the audited UFS/Virtio storage stack in
+# the baseline script (XNU_BOOT_PROGRESS gate); disable it for now and re-enable
+# with NativeEmmc (+ gate extension for eMMC).
 CONFIG_XNU_OWNER_CACHE_MOUNT=y
 CONFIG_XNU_OWNER_CACHE_STARTUP=y
 CONFIG_XNU_OWNER_BOOT_MANIFEST=y
@@ -32,7 +42,7 @@ CONFIG_XNU_DT_PANIC_REGION=y
 CONFIG_XNU_ZONE_PGZ_ALIGNMENT_PROBE=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
-CONFIG_XNU_BOOT_PROGRESS=y
+CONFIG_XNU_BOOT_PROGRESS=n
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
