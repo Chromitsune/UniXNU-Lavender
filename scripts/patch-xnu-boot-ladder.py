@@ -40,6 +40,27 @@ PAINT = """
   dsb sy
 """
 
+# The same paint, but the boot arguments are reached through a kernel global
+# (const_boot_args) instead of a register.  Needed once the kernel is in C,
+# where no register still holds the boot arguments.
+#
+# The kernel's own page tables only map the kernel window, so the frame buffer
+# is not reachable from C.  The probe therefore drops the MMU for the duration
+# of the paint: the probe code itself runs from the kernel window, whose
+# addresses are valid physical addresses, so the paint reaches the frame
+# buffer physically and the MMU is restored afterwards.
+PAINT_GLOBAL = """
+  mrs x10, sctlr_el1
+  bic x11, x10, #1
+  msr sctlr_el1, x11
+  isb
+  adrp x9, global
+  add x9, x9, {off}
+""" + PAINT.format(args='x9', band='{band}', lo='{lo}', hi='{hi}') + """
+  msr sctlr_el1, x10
+  isb
+"""
+
 # The colours are 0xAARRGGBB in the frame buffer (BGRA on this panel).
 COLOURS = [
     (0x00FF, 0x0000),   # band 2: green
@@ -62,7 +83,7 @@ MILESTONES = [
     ('msr SCTLR_EL1, x0', 0xD5181000),
 ]
 
-CAVE_SIZE = 0x60
+CAVE_SIZE = 0x80
 NOP = 0xD503201F
 
 
@@ -152,6 +173,16 @@ def kernel_symbols(data):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('kernel', type=Path, help='the COPY of the kernel to patch in place')
+    parser.add_argument('--function', default='_start_first_cpu',
+                        help='the symbol whose body is scanned for the milestone instructions')
+    parser.add_argument('--site', action='append', default=[],
+                        metavar='WORD:LABEL',
+                        help='an extra probe: the 32-bit instruction word to hook and its label')
+    parser.add_argument('--band', type=int, default=2, help='the first band number to use')
+    parser.add_argument('--args-global', metavar='SYMBOL',
+                        help='read the boot arguments from this kernel global instead of a register')
+    parser.add_argument('--args-address', type=lambda value: int(value, 0),
+                        help='the address of the boot arguments copy in the kernel image')
     args = parser.parse_args()
     data = bytearray(args.kernel.read_bytes())
     load_segments(data)
@@ -170,14 +201,19 @@ def main():
 
     # The probes live in the boot CPU entry function.
     names = kernel_symbols(data)
-    start_va = names.get('_start_first_cpu', entry)
+    start_va = names.get(args.function, entry)
     window_start = start_va
     window_end = start_va + 0x4000
     base = file_offset(window_start)
     limit = file_offset(window_end)
 
+    milestones = [] if args.site else list(MILESTONES)
+    for item in args.site:
+        word, _, label = item.partition(':')
+        milestones.append((label or word, int(word, 0)))
+
     sites = []
-    for name, word in MILESTONES:
+    for name, word in milestones:
         found = None
         at = base
         while at + 4 <= limit:
@@ -198,12 +234,25 @@ def main():
             site_va = window_start + (at - base)
             cave_va = caves + index * CAVE_SIZE
             lo, hi = COLOURS[index % len(COLOURS)]
-            band = index + 2
-            source = ('.text\n.global _start\n_start:\n' +
-                      PAINT.format(args='x20', band=band, lo=f'{lo:#x}', hi=f'{hi:#x}') +
+            band = args.band + index
+            symbols = {'target': site_va + 4}
+            if args.args_global or args.args_address:
+                if args.args_address:
+                    target = args.args_address
+                else:
+                    target = names.get(args.args_global)
+                    if not target:
+                        raise SystemExit(f'kernel symbol not found or common: {args.args_global}; '
+                                         'pass --args-address with the address from the build')
+                body = PAINT_GLOBAL.format(off=target & 0xFFF, band=band,
+                                           lo=f'{lo:#x}', hi=f'{hi:#x}')
+                symbols['global'] = target
+            else:
+                body = PAINT.format(args='x20', band=band, lo=f'{lo:#x}', hi=f'{hi:#x}')
+            source = ('.text\n.global _start\n_start:\n' + body +
                       f'  .word {word:#010x}\n' +
                       '  b target\n')
-            code = assemble(source, cave_va, work, {'target': site_va + 4})
+            code = assemble(source, cave_va, work, symbols)
             if len(code) > CAVE_SIZE:
                 raise SystemExit(f'probe {name} is too large')
             data[file_offset(cave_va):file_offset(cave_va) + len(code)] = code
