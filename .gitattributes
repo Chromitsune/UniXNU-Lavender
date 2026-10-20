@@ -1,0 +1,3 @@
+*.py text
+*.toml text
+* text=lf

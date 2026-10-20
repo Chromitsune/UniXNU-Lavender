@@ -1,0 +1,164 @@
+# Board description of the Xiaomi Redmi Note 7 (lavender, SDM660), read by the unixnu build driver.
+# All physical values below are pinned from the phone's own interfaces: its stock
+# compiled FDT (notes/lavender-fdt.dts), its GPT, and its on-device boot behaviour.
+
+[board]
+name = "lavender"
+soc = "SDM660"
+description = "Xiaomi Redmi Note 7 (eMMC, 4 GB DRAM, 1080x2340 panel)"
+kit = "lavender"                   # the package/ of this repository appears as kits/lavender in the build tree
+
+# The target OS image: the unchanged iPad7,1 iPadOS 17.7.11 restore image (same
+# pin as the sheng reference board, so the fetched components are shared).
+# Give --ipsw PATH to use a local file; without it the remote url is read with
+# range requests, only the members that are needed.
+[ipsw]
+url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
+product = "iPad7,1"
+version = "17.7.11"
+build = "21H461"
+device_class = "j120ap"
+chip_id = 0x8011
+board_id = 12
+fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
+
+[ipsw.sha256]
+"044-76040-038.dmg" = "3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d"
+"044-76034-038.dmg" = "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
+
+# The raw image for the userdata partition: the OS and SystemOS disk images of
+# the IPSW behind a manifest. first_lba/last_lba are the GPT entry "userdata" of
+# the phone (eMMC = 512-byte logical blocks, unlike UFS boards).
+[userdata]
+first_lba = 0xEC0100               # 15466496
+last_lba = 0xE92CFFE               # 244285406
+lba_bytes = 512
+windows = [
+  { name = "OS", component = "OS" },
+  { name = "SystemOS", component = "Cryptex1,SystemOS" },
+]
+
+[kernel]
+defconfig = "lavender_defconfig"
+
+[kernel.prelink]
+tool = "kits/NativePrelink/emit_prelink.py"
+kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
+kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
+slide = "-0x1000000"
+early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
+roots = [
+  "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib",
+  "com.apple.driver.AppleARMPlatform",
+  "com.apple.driver.AppleARMWatchdogTimer",
+  "com.apple.driver.AppleAudioClockLibs",
+  "com.apple.driver.AppleEffaceableStorage",
+  "com.apple.driver.AppleIISController",
+  "com.apple.driver.AppleM2ScalerCSCDriver",
+  "com.apple.driver.AppleMobileFileIntegrity",
+  "com.apple.driver.ApplePMGR",
+  "com.apple.driver.IODARTFamily",
+  "com.apple.filesystems.apfs",
+  "com.apple.iokit.CoreAnalyticsFamily",
+  "com.apple.iokit.IOAVFamily",
+  "com.apple.iokit.IOAudio2Family",
+  "com.apple.iokit.IOCECFamily",
+  "com.apple.iokit.IOCryptoAcceleratorFamily",
+  "com.apple.iokit.IOGPUFamily",
+  "com.apple.iokit.IOHDCPFamily",
+  "com.apple.iokit.IOMobileGraphicsFamily",
+  "com.apple.iokit.IOReportFamily",
+  "com.apple.iokit.IOSlowAdaptiveClockingFamily",
+  "com.apple.iokit.IOStorageFamily",
+  "com.apple.iokit.IOSurface",
+  "com.apple.kec.Libm",
+  "com.apple.kec.corecrypto",
+  "com.apple.kext.AppleMatch",
+  "com.apple.kext.CoreTrust",
+  "com.apple.security.AppleImage4",
+  "com.apple.security.sandbox",
+  "com.apple.iokit.IOHIDFamily",
+  "com.apple.iokit.IOHIDEventDriver",
+]
+
+# Firmware: our own RedmiNote7Pkg (built from the phone's carved stock XBL
+# drivers + open EDK2 core), NOT the Mu-Silicium tree used by sheng. It lives
+# at <workspace>/edk2-firmware-build and is built with the macOS clang/lld shim
+# toolchain; see notes/lavender-port-plan.md for the exact build commands.
+[firmware]
+config = "lavender"
+dsc = "RedmiNote7Pkg/RedmiNote7Pkg.dsc"
+fd = "Build/RedmiNote7Pkg/{target}_GCC5/FV/REDMINOTE7PKG_UEFI.fd"
+preflight = []                     # firmware bring-up is already proven on device
+submodules = []
+patches = []
+packages = [
+  "{tree}/edk2-firmware-build/edk2",
+  "{tree}/edk2-firmware-build/edk2-platforms",
+  "{tree}/edk2-firmware-build/RedmiNote7Pkg",
+]
+
+[firmware.defines]
+DEVICE_MODEL = "lavender"
+
+# The ramdisk of the boot image: a FAT volume with the UniXNU config, the
+# kernel, its Apple device tree and the optional trust cache and Data seed.
+# The loader (DarwinBoot/UniXNU.efi) boots through our firmware startup.nsh.
+[payload]
+volume = "LAVENDERESP"
+size_mib = 192
+loader = "firmware"
+title = "lavender first boot: source 4K XNU to console"
+dram_size = "0x17e4c0000"          # sum of the two banks in the stock FDT memory node
+panic_screen = true                # patch panic() screen output into the payload copy of the kernel
+# trust_cache_sha256: same target image as sheng; pins added after first fetch
+trust_cache_sha256 = [
+  "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
+  "8900d6a93d7a59ce1a872a5c081e559f4240a218f97e12d44d22dda46644d68f",
+]
+kernel_args = [
+  "-v",
+  "serial=3",
+  "debug=0x14e",
+  "kt_fixed_zones=120",
+  "boot-progress=2",
+  "-apfs_shared_datavolume",
+  "boot-ui-focus=PreBoard",
+  "boot-diag-resume=0",
+  "-no_slto_panic",
+  # bring-up gates tuned for the eMMC board; extend as the stack converges
+  "offline-legacy-register=1",
+  "offline-legacy-gop=1",
+  "offline-hid-input=1",
+]
+
+[payload.adt]
+tool = "scripts/make-lavender-adt.py"
+chip_id = "207"
+owned_memory_size = "0x130000000"  # 4.75 GB DRAM: DarwinBoot takes a generous contiguous window
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+cpu_regs = "0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"   # stock FDT /cpus reg list, boot CPU 0 first
+psci_method = "smc"                # stock FDT: enable-method = "psci", method = "smc"
+packed_data_ramdisk = true
+ipad_identity = true
+unique_chip_id = "required"        # the platform seed is not stored in any repository
+
+# Image parameters: AOSP v0 header, the values proven against Xiaomi's ABL by
+# make-bootimg.py/bootimg.cfg (the exact set that booted the phone first try).
+[bootimg.image]
+base = 0x0
+kernel_offset = 0x8000
+ramdisk_offset = 0x1000000
+second_offset = 0xf00000
+tags_offset = 0x100
+pagesize = 4096
+header_version = 0
+
+# The stock bootloader expects the splash region in the device tree or it
+# powers the panel off: pin the phone's own cont_splash reservation.
+[[bootimg.dtb_node]]
+path = "/reserved-memory/splash_region@9d400000"
+props = [
+  { name = "label", type = "s", value = "cont_splash_mem" },
+  { name = "reg", type = "x", value = ["0x0", "0x9d400000", "0x0", "0x2300000"] },
+]
