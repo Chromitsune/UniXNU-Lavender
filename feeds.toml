@@ -8,3 +8,21 @@ kind = "refer"
 git = "https://github.com/ONLYA/corecrypto-2023"
 ref = "main"
 commit = "11fba65b12d8830630e248dfa8344caf8b065f26"
+
+# The ordinary ARM64 block storage interface, qualified by the storage ABI
+# audit before the native block driver is compiled against it.
+[[source]]
+name = "IOStorageFamily"
+kind = "refer"
+git = "https://github.com/apple-oss-distributions/IOStorageFamily.git"
+ref = "main"
+commit = "e45fbe30a7879e0b16e26dddb78538f1b00e0bff"
+
+# The matching Darwin 23 pthread component, registered by the source-pthread
+# bootstrap patch.
+[[source]]
+name = "libpthread"
+kind = "refer"
+git = "https://github.com/apple-oss-distributions/libpthread.git"
+ref = "rel/libpthread-519"
+commit = "c0e60fb5ecfc54cf379c261d3f9572cc22ded891"

@@ -1,9 +1,9 @@
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -619,6 +619,25 @@
- 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
- 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
- 
+@@ -623,6 +623,27 @@
+ 	// the early debugger rather than corrupting memory or forging a map.
+ 	b Lbootstrap_tables_exhausted
+ Lbootstrap_tables_ready:
 +	/*
 +	 * Map the video frame buffer.
 +	 *
@@ -25,6 +25,6 @@
 +	mov	x2, x4				// the advanced free table pointer
 +1:
 +
- 	b Lbootstrap_tables_ready
- Lbootstrap_tables_exhausted:
- 	// MMU is still off. Stop with the offending cursor/end preserved for
+ 	/* Ensure TTEs are visible */
+ 	dsb		ish
+ 

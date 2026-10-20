@@ -42,24 +42,12 @@ PAINT = """
 
 # The same paint, but the boot arguments are reached through a kernel global
 # (const_boot_args) instead of a register.  Needed once the kernel is in C,
-# where no register still holds the boot arguments.
-#
-# The kernel's own page tables only map the kernel window, so the frame buffer
-# is not reachable from C.  The probe therefore drops the MMU for the duration
-# of the paint: the probe code itself runs from the kernel window, whose
-# addresses are valid physical addresses, so the paint reaches the frame
-# buffer physically and the MMU is restored afterwards.
+# where no register still holds the boot arguments.  The frame buffer itself
+# is mapped by the early bootstrap tables, so it is reachable from C.
 PAINT_GLOBAL = """
-  mrs x10, sctlr_el1
-  bic x11, x10, #1
-  msr sctlr_el1, x11
-  isb
   adrp x9, global
   add x9, x9, {off}
-""" + PAINT.format(args='x9', band='{band}', lo='{lo}', hi='{hi}') + """
-  msr sctlr_el1, x10
-  isb
-"""
+""" + PAINT.format(args='x9', band='{band}', lo='{lo}', hi='{hi}')
 
 # The colours are 0xAARRGGBB in the frame buffer (BGRA on this panel).
 COLOURS = [
