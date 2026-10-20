@@ -349,6 +349,27 @@ def assemble(source, va, symbols, workdir):
     return binary.read_bytes()
 
 
+def padded_clear(data, start, length):
+    """Padding that may be zero-fill or linker NOP alignment (0xd503201f).
+
+    Full words must be zero or NOP. A non-word-aligned remainder is only tolerated
+    when the word containing it is pure zero or pure NOP filler (the panic code is
+    branch-targeted, so it never depends on padding contents; this check exists to
+    refuse a wrong site where real instructions or data live).
+    """
+    whole = length - length % 4
+    if whole:
+        for value in struct.unpack_from(f'<{whole // 4}I', data, start):
+            if value not in (0, 0xD503201F):
+                return False
+    tail_start, tail = start + whole, data[start + whole:length]
+    if not tail:
+        return True
+    word_start = start + whole - 4
+    word = struct.unpack_from('<I', data, max(word_start, 0))[0]
+    return all(not b for b in tail) or word in (0, 0xD503201F)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('kernel', type=Path, help='the COPY of the kernel to patch in place')
@@ -374,8 +395,8 @@ def main():
         if word(va) != value:
             raise SystemExit(f'{va:#x} holds {word(va):#010x}, expected {value:#010x}: not the kernel these probes are for')
     for va in CAVES.values():
-        if any(data[file_offset(va):file_offset(va) + CAVE_SIZE]):
-            raise SystemExit(f'Padding at {va:#x} is not empty')
+        if not padded_clear(data, file_offset(va), CAVE_SIZE):
+            raise SystemExit(f'Padding at {va:#x} is not empty (nor NOP-alignment fill)')
 
     # (site, cave stage, symbols the cave is linked with)
     sites = [(ENTRY_VA, 1, {'target': START_FIRST_CPU}),
@@ -403,15 +424,15 @@ def main():
     if args.panic_screen:
         # Right after the last probe cave in use, so the padding is shared as tightly as possible.
         PANIC_CAVE = max(CAVES[stage] for _, stage, _ in sites) + CAVE_SIZE
-        if word(PANIC_VA) in (0, 0xFFFFFFFF) or any(data[file_offset(PANIC_CAVE):file_offset(PANIC_CAVE_END)]):
+        if word(PANIC_VA) in (0, 0xFFFFFFFF) or not padded_clear(data, file_offset(PANIC_CAVE), file_offset(PANIC_CAVE_END) - file_offset(PANIC_CAVE)):
             raise SystemExit('panic() or the panic screen padding is not as expected')
         with tempfile.TemporaryDirectory() as tmp:
             code, load, entry = assemble_c(ROOT / 'scripts/xnu-panic-screen.c', PANIC_CAVE, Path(tmp), kernel_names)
             common_entry = panic_common_entry(Path(tmp), code, load)
         if load + len(code) > PANIC_CAVE_END:
             raise SystemExit(f'panic screen is {len(code):#x} bytes at {load:#x}, the padding ends at {PANIC_CAVE_END:#x}')
-        if any(data[file_offset(load):file_offset(load) + len(code)]):
-            raise SystemExit(f'Padding at {load:#x} is not empty')
+        if not padded_clear(data, file_offset(load), len(code)):
+            raise SystemExit(f'Padding at {load:#x} is not empty (nor NOP-alignment fill)')
         data[file_offset(load):file_offset(load) + len(code)] = code
         struct.pack_into('<I', data, file_offset(PANIC_VA), branch(PANIC_VA, entry))
         common = kernel_names.get('_panic_trap_to_debugger')
