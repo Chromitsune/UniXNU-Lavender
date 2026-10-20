@@ -35,6 +35,9 @@ struct ctx {
   u32 logn;
 };
 
+#ifndef BOOT_ARGS
+#define BOOT_ARGS 0UL
+#endif
 #ifndef PANIC_TEXT
 #define PANIC_TEXT 0UL
 #endif
@@ -226,7 +229,22 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   g.rb   = v->v_rowbytes;
   g.w    = v->v_width;
   g.h    = v->v_height;
-  if (g.base == 0 || v->v_depth != 32 || fmt == 0) {
+  if (g.base == 0 || v->v_depth != 32) {
+    /*
+     * The video console does not exist yet: fall back to the frame buffer the
+     * firmware described in the boot arguments.  The early bootstrap tables map
+     * that frame buffer, so the panel is reachable from here.
+     */
+    volatile u64 *video = (volatile u64 *)((u8 *)BOOT_ARGS + 0x28);
+    g.base = (u8 *)video[0];
+    g.rb   = (u32)video[2];
+    g.w    = (u32)video[3];
+    g.h    = (u32)video[4];
+    if (g.base == 0 || video[5] != 32) {
+      park ();
+    }
+  }
+  if (fmt == 0) {
     park ();
   }
 

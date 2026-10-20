@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DRAM_BASE = 0x80000000
 DRAM_SIZE_EXPECTED = 0x17E4C0000   # stock FDT memory node sum (banks 0x80000000+0x80000000, 0x100000000+0x7e4c0000)
 ARMIO_BASE = 0x17000000            # APSS peripheral block containing the GIC
+ARMIO_SIZE = 0x1C00000            # covers the distributor and the 1 MiB redistributor region
 GIC_DIST = 0x17A00000
 GIC_DIST_SIZE = 0x10000
 GIC_REDIST = 0x17B00000
@@ -70,6 +71,16 @@ def empty_nvram_proxy():
             ('nvram-bank-count', struct.pack('<I', 1)),
             ('nvram-current-bank', struct.pack('<I', 0)),
             ('nvram-proxy-data', bytes(image))]
+
+
+NVRAM_PROXY_LEN = 8192
+
+# IODTNVRAM (the original security extension that owns the SEP NVRAM) reads
+# /options/p_len while it starts.  A missing property comes back as ENODATA,
+# which the kext treats as fatal ("panic: optional not set"), so the tree has
+# to carry the length of the volatile NVRAM area.  Without it the kernel dies
+# in the security-extension load, long before any of our own code runs.
+NVRAM_OPTIONS = [('p_len', struct.pack('<Q', NVRAM_PROXY_LEN))]
 
 
 def main():
@@ -129,6 +140,14 @@ def main():
     cpus = [node('cpu%d' % index, [('state', b'running\0' if index == 0 else b'waiting\0'),
                                    ('reg', struct.pack('<I', reg)),
                                    ('device_type', b'cpu\0'), ('compatible', compat),
+                                   # The original AppleARMCPU kext validates the CPU
+                                   # configuration against Apple's own device tree
+                                   # layout: /cpus/max_cpus, a per-core cpu-id and an
+                                   # interrupts list whose first entry is the AIC IPI
+                                   # PPI.  Without them it panics with "CPU
+                                   # configuration in device tree is invalid".
+                                   ('cpu-id', struct.pack('<I', index)),
+                                   ('interrupts', struct.pack('<3I', 0, 0, 4)),
                                    ('timebase-frequency', struct.pack('<I', TIMEBASE))])
             for index, (reg, compat) in enumerate(zip(cpu_regs, core_compatible))]
     tree = node('device-tree', [
@@ -176,12 +195,12 @@ def main():
                                  ([('TrustCache', bytes(16))] if args.trust_cache else [])),
               # Read by the original AppleImage4 at start-up; present and empty here.
               node('manifest-properties')]),
-        node('cpus', children=cpus),
+        node('cpus', [('max_cpus', struct.pack('<I', len(cpus)))], children=cpus),
         *([node('psci', [('compatible', b'arm,psci-1.0\0'), ('method', args.psci_method.encode() + b'\0')])] if len(cpus) > 1 else []),
         # Suspend/resume is not implemented for this board. Use the original
         # root-domain policy input rather than allowing the CPU to park forever.
         node('defaults', [('sleep-disabled', struct.pack('<I', 1))]),
-        node('options', []),
+        node('options', NVRAM_OPTIONS),
         # The original AppleImage4 panics without a product node. Name and model are the
         # board DT's own strings.
         *( [node('buttons', [('compatible', b'buttons\0'), ('device_type', b'buttons\0'),
@@ -203,7 +222,10 @@ def main():
         node('arm-io', [('device_type', b'arm-io\0'),
                         ('#address-cells', struct.pack('<I', 2)),
                         ('#size-cells', struct.pack('<I', 2)),
-                        ('ranges', struct.pack('<QQQ', 0, ARMIO_BASE, 0x0C00000))],
+                        # The window has to cover the redistributor frames as well:
+                        # the GICv3 redistributor sits at ARMIO_BASE + 0xB00000 and is
+                        # 1 MiB long, so the range has to reach 0x1B00000.
+                        ('ranges', struct.pack('<QQQ', 0, ARMIO_BASE, ARMIO_SIZE))],
              [node('intc', [('compatible', b'arm,gic-v3\0'),
                             ('reg', struct.pack('<4Q',
                                                 GIC_DIST - ARMIO_BASE, GIC_DIST_SIZE,

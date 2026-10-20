@@ -24,18 +24,25 @@ SEGMENTS = []
 PAINT = """
   ldr x1, [{args}, #0x28]
   ldr x2, [{args}, #0x38]
-  ldr x3, [{args}, #0x48]
-  mul x2, x2, x3
-  lsr x2, x2, #4
-  bic x2, x2, #7
-  mov x4, #{band}
-  mul x5, x2, x4
-  add x1, x1, x5
+  mov x3, #{band}
+  sub x3, x3, #1
+  mov x4, #16
+  mul x3, x3, x4
+  mul x3, x3, x2
+  add x1, x1, x3
+  lsr x2, x2, #3
+  mov x3, #16
   movz w6, #{lo}
   movk w6, #{hi}, lsl #16
 1:
-  stp w6, w6, [x1], #8
-  subs x2, x2, #8
+  mov x4, x1
+  mov x5, x2
+2:
+  stp w6, w6, [x4], #8
+  subs x5, x5, #1
+  b.hi 2b
+  add x1, x1, x4
+  subs x3, x3, #1
   b.hi 1b
   dsb sy
 """
@@ -124,13 +131,30 @@ def assemble(source, va, workdir, symbols):
 
 
 def find_cave(data, start_va, count):
-    """Find a run of NOP padding big enough for the caves, near the entry."""
-    start = file_offset(start_va)
-    for offset in range(start, max(start - 0x20000, 0), -4):
-        words = struct.unpack_from(f'<{count * CAVE_SIZE // 4}I', data, offset)
-        if all(word == NOP for word in words):
-            return start_va - (start - offset)
-    raise SystemExit('no NOP padding found for the probe caves')
+    """Find the largest run of padding (zeros or NOPs) that holds the caves."""
+    need = count * CAVE_SIZE
+    best = None
+    for segment in SEGMENTS:
+        vmaddr, vmsize, fileoff, filesize = segment
+        if not (vmaddr <= start_va < vmaddr + vmsize):
+            continue  # stay in the segment that holds the entry code
+        at = fileoff
+        end = fileoff + filesize
+        while at < end - 4:
+            word = struct.unpack_from('<I', data, at)[0]
+            if word in (0, NOP):
+                stop = at
+                while stop < end - 4 and struct.unpack_from('<I', data, stop)[0] in (0, NOP):
+                    stop += 4
+                if stop - at >= need and (best is None or stop - at > best[0]):
+                    best = (stop - at, vmaddr + (at - fileoff))
+                at = stop
+            else:
+                at += 4
+    if best is None:
+        raise SystemExit('no padding found for the probe caves')
+    print(f'probe caves: {best[0]:#x} bytes of padding at {best[1]:#x}')
+    return best[1]
 
 
 def kernel_symbols(data):
@@ -166,6 +190,15 @@ def main():
     parser.add_argument('--site', action='append', default=[],
                         metavar='WORD:LABEL',
                         help='an extra probe: the 32-bit instruction word to hook and its label')
+    parser.add_argument('--call', action='append', default=[],
+                        metavar='SYMBOL:LABEL',
+                        help='an extra probe: the call to that symbol inside the function')
+    parser.add_argument('--call-after', action='append', default=[],
+                        metavar='SYMBOL:LABEL',
+                        help='a probe on the instruction after the call to that symbol')
+    parser.add_argument('--site-at', action='append', default=[],
+                        metavar='ADDRESS:LABEL',
+                        help='a probe on the instruction at an exact address')
     parser.add_argument('--band', type=int, default=2, help='the first band number to use')
     parser.add_argument('--args-global', metavar='SYMBOL',
                         help='read the boot arguments from this kernel global instead of a register')
@@ -195,10 +228,56 @@ def main():
     base = file_offset(window_start)
     limit = file_offset(window_end)
 
-    milestones = [] if args.site else list(MILESTONES)
+    exact = []
+    for item in args.site_at:
+        address, _, label = item.partition(':')
+        exact.append((int(address, 0), label or address))
+
+    milestones = [] if (args.site or exact) else list(MILESTONES)
     for item in args.site:
         word, _, label = item.partition(':')
         milestones.append((label or word, int(word, 0)))
+    calls = []
+    for item in args.call:
+        symbol, _, label = item.partition(':')
+        calls.append((symbol, label or symbol, False))
+    for item in args.call_after:
+        symbol, _, label = item.partition(':')
+        calls.append((symbol, label or symbol, True))
+
+    # A call site is found by its target: the call is a direct branch to the symbol.
+    for symbol, label, after in calls:
+        target = names.get(symbol) or names.get('_' + symbol)
+        if target is None:
+            raise SystemExit(f'kernel symbol not found: {symbol}')
+        # The prelinked region sits a fixed distance from the linked image, so the
+        # target is accepted at either address.  A call cannot be replayed inside
+        # a cave (it would set the link register to the cave), so the probe can
+        # be placed on the instruction after the call instead.
+        found = None
+        for vmaddr, vmsize, fileoff, filesize in SEGMENTS:
+            if vmsize == 0:
+                continue
+            at = fileoff
+            end = fileoff + filesize
+            while at + 4 <= end:
+                word = struct.unpack_from('<I', data, at)[0]
+                if word & 0xFC000000 == 0x94000000:
+                    site = vmaddr + (at - fileoff)
+                    called = site + (word & 0x3FFFFFF) * 4
+                    if called in (target, target + 0x100000000) and site >= window_start:
+                        found = at + (4 if after else 0)
+                        break
+                at += 4
+            if found is not None:
+                break
+        if found is None:
+            raise SystemExit(f'call to {symbol} not found in the function')
+        milestones.append((label, struct.unpack_from('<I', data, found)[0]))
+
+    for address, label in exact:
+        at = file_offset(address)
+        milestones.append((label, struct.unpack_from('<I', data, at)[0]))
 
     sites = []
     for name, word in milestones:

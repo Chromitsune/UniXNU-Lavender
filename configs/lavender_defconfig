@@ -18,7 +18,7 @@ CONFIG_XNU_SOURCE_CORECRYPTO14=y
 CONFIG_XNU_SOURCE_PTHREAD=y
 CONFIG_XNU_ARM_DT_PLATFORM=y
 CONFIG_XNU_ARMCPU=y
-CONFIG_XNU_NATIVE_AES=y
+CONFIG_XNU_NATIVE_AES=n
 CONFIG_XNU_NATIVE_RAM_BLOCK=n
 CONFIG_XNU_TRUST_CACHE_RUNTIME=y
 CONFIG_XNU_SOURCE_MOCKFS=n
@@ -35,6 +35,9 @@ CONFIG_XNU_BOOT_PROGRESS=n
 CONFIG_XNU_DT_PANIC_REGION=y
 CONFIG_XNU_ZONE_PGZ_ALIGNMENT_PROBE=y
 # ARCH_TIMER needs the ArmCpu interrupt provider, which is linked now.
+# NATIVE_AES stays off for now: the driver binds the original IOAESAccelerator
+# class, and that binding needs the AES interface audit (and its probed prelink
+# candidate) before it can be compiled.
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=n

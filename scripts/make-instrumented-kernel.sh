@@ -10,7 +10,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TREE=${UNIXNU_TREE:-/Users/rebuke/aOS/UniXNU/out/lavender/tree}
 OUT=${1:-/tmp/kernel-instrumented.macho}
-KERNEL="$TREE/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
+KERNEL=${UNIXNU_KERNEL:-/Users/rebuke/aOS/UniXNU/out/lavender/kernel/kernel.macho}
 
 if [ ! -f "$KERNEL" ]; then
   echo "no built kernel at $KERNEL" >&2
@@ -18,7 +18,11 @@ if [ ! -f "$KERNEL" ]; then
 fi
 
 cp "$KERNEL" "$OUT"
-python3 "$ROOT/scripts/patch-xnu-entry-probe.py" "$OUT" --panic-screen --no-reset
+# The panic screen is deliberately left out: it runs with the MMU on, where the
+# panel is not mapped by the kernel's own tables yet (the early frame buffer
+# mapping patch is disabled, it used to destroy the bootstrap page tables).
+python3 "$ROOT/scripts/patch-xnu-entry-probe.py" "$OUT" --no-reset \
+  --boot-args 0xfffffff007167d18 --panic-cave 0xfffffff007a1e610
 
 # The early boot: the MMU enable site belongs to the panic screen probe, so
 # the ladder starts after it.
@@ -30,14 +34,13 @@ python3 "$ROOT/scripts/patch-xnu-boot-ladder.py" "$OUT" --function _start_first_
   --site 0xD5182041:msr_TCR \
   --site 0xD5182020:msr_TTBR1
 
-# The C init: the boot arguments are read from the kernel's own copy.
-python3 "$ROOT/scripts/patch-xnu-boot-ladder.py" "$OUT" --function _arm_init --band 8 \
-  --args-address 0xfffffff007167d18 \
-  --site 0x97fe50ee:PE_get_default \
-  --site 0x97fe4de1:PE_parse_boot_argn \
-  --site 0xD500419F:msr_PAN \
-  --site 0x97e8ecc7:arm_vm_init \
-  --site 0x97e9024c:patch_low_glo \
-  --site 0x97ff3cbc:kernel_startup
+# The C init ladder is optional: the call sites move with every kernel build.
+if [ "${UNIXNU_C_LADDER:-0}" = 1 ]; then
+  python3 "$ROOT/scripts/patch-xnu-boot-ladder.py" "$OUT" --function _arm_init --band 8 \
+    --args-address 0xfffffff007167d18 \
+    --site-at 0xfffffff0079afafc:PE_parse_boot_argn \
+    --site-at 0xfffffff0079afb20:PE_get_default \
+    --site-at 0xfffffff0079afb74:arm_vm_init || echo "C ladder sites moved with the kernel build; skipped"
+fi
 
 echo "instrumented kernel: $OUT"

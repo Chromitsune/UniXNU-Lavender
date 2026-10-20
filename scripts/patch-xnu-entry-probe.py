@@ -48,6 +48,7 @@ PANIC_CAVE_END = 0xFFFFFFF00B9D0FF0
 CAVE_SIZE = 0x60
 CAVES = {1: 0xFFFFFFF00B9D0500, 2: 0xFFFFFFF00B9D0560, 3: 0xFFFFFFF00B9D05C0, 4: 0xFFFFFFF00B9D0620}
 TIMEBASE = 19200000
+BOOT_ARGS = 0        # the kernel's copy of the boot arguments (panic screen fallback)
 
 PAINT = """
   ldr x1, [{args}, #0x28]
@@ -198,8 +199,12 @@ def assemble_c(source, va, workdir, symbols):
         if not any(base <= text and text + 256 <= base + size for base, size, _, _ in SEGMENTS):
             raise SystemExit('Invalid _boot_progress_panic_text')
         definitions.append(f'-DPANIC_TEXT={text:#x}UL')
+    # The kernel's own copy of the boot arguments, used when the video console
+    # does not exist yet and the panic screen falls back to the frame buffer.
+    boot_args = BOOT_ARGS or symbols.get('_const_boot_args') or 0
     subprocess.run([clang, '--target=aarch64-none-elf', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
                     '-mgeneral-regs-only', '-fno-pic', '-mcmodel=tiny', '-Oz', f'-DVINFO={VINFO_VA:#x}UL',
+                    f'-DBOOT_ARGS={boot_args:#x}UL',
                     *definitions, f'-I{font_dir}', '-c', source, '-o', obj], check=True)
     script = workdir / 'panic.ld'
     script.write_text('SECTIONS { . = %#x; .text : { *(.text.a_entry) *(.text.a_common) *(.text*) *(.rodata*) } /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.ARM.*) } }\n' % va)
@@ -370,6 +375,21 @@ def padded_clear(data, start, length):
     return all(not b for b in tail) or word in (0, 0xD503201F)
 
 
+def padding_extent(data, va):
+    """The padded run around va: (start, end) virtual addresses."""
+    at = file_offset(va)
+    start = at
+    while start >= 4 and struct.unpack_from('<I', data, start - 4)[0] in (0, 0xD503201F):
+        start -= 4
+    end = at
+    while struct.unpack_from('<I', data, end)[0] in (0, 0xD503201F):
+        end += 4
+    for vmaddr, vmsize, fileoff, filesize in SEGMENTS:
+        if fileoff <= at < fileoff + filesize:
+            return vmaddr + (start - fileoff), vmaddr + (end - fileoff)
+    raise SystemExit('cave is not in a file-backed segment')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('kernel', type=Path, help='the COPY of the kernel to patch in place')
@@ -379,6 +399,10 @@ def main():
     parser.add_argument('--panic-screen', action='store_true', help='draw panic() messages on the screen')
     parser.add_argument('--no-reset', action='store_true', help='no reset probe at all')
     parser.add_argument('--occurrence', type=int, default=1, help='which call to SYMBOL (1 = first)')
+    parser.add_argument('--boot-args', type=lambda value: int(value, 0),
+                        help='the address of the kernel\'s copy of the boot arguments')
+    parser.add_argument('--panic-cave', type=lambda value: int(value, 0),
+                        help='the address of the padding the panic screen is placed in')
     parser.add_argument('--in', dest='function', default='_arm_init', help='function that makes the call (default _arm_init)')
     args = parser.parse_args()
     if args.reset_before and not args.reset_after:
@@ -424,13 +448,20 @@ def main():
     if args.panic_screen:
         # Right after the last probe cave in use, so the padding is shared as tightly as possible.
         PANIC_CAVE = max(CAVES[stage] for _, stage, _ in sites) + CAVE_SIZE
-        if word(PANIC_VA) in (0, 0xFFFFFFFF) or not padded_clear(data, file_offset(PANIC_CAVE), file_offset(PANIC_CAVE_END) - file_offset(PANIC_CAVE)):
+        panic_limit = PANIC_CAVE_END
+        if args.panic_cave:
+            # A different kernel has a different padding layout: use the given
+            # padding and check it against the space that is actually there.
+            cave_start, cave_end = padding_extent(data, args.panic_cave)
+            PANIC_CAVE = max(cave_start, args.panic_cave)
+            panic_limit = cave_end
+        if word(PANIC_VA) in (0, 0xFFFFFFFF) or not padded_clear(data, file_offset(PANIC_CAVE), file_offset(panic_limit) - file_offset(PANIC_CAVE)):
             raise SystemExit('panic() or the panic screen padding is not as expected')
         with tempfile.TemporaryDirectory() as tmp:
             code, load, entry = assemble_c(ROOT / 'scripts/xnu-panic-screen.c', PANIC_CAVE, Path(tmp), kernel_names)
             common_entry = panic_common_entry(Path(tmp), code, load)
-        if load + len(code) > PANIC_CAVE_END:
-            raise SystemExit(f'panic screen is {len(code):#x} bytes at {load:#x}, the padding ends at {PANIC_CAVE_END:#x}')
+        if load + len(code) > panic_limit:
+            raise SystemExit(f'panic screen is {len(code):#x} bytes at {load:#x}, the padding ends at {panic_limit:#x}')
         if not padded_clear(data, file_offset(load), len(code)):
             raise SystemExit(f'Padding at {load:#x} is not empty (nor NOP-alignment fill)')
         data[file_offset(load):file_offset(load) + len(code)] = code
