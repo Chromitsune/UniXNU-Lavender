@@ -107,7 +107,7 @@ DEVICE_MODEL = "lavender"
 [payload]
 volume = "LAVENDERESP"
 size_mib = 192
-loader = "firmware"
+loader = "payload"                # our phone firmware has no DarwinBoot in its FV: ship the driver on the ESP
 title = "lavender first boot: source 4K XNU to console"
 dram_size = "0xfe4c0000"           # size of the stock FDT memory span (0x80000000..0x17e4c0000), ~3.98 GiB
 panic_screen = false               # patcher offsets assume the full qualified kernel layout (legacy display on); revisit after NativeLegacyDisplay lands
@@ -132,7 +132,7 @@ chip_id = "207"
 owned_memory_size = "0x30000000"   # 768 MB contiguous DarwinBoot window (fits in the 4 GB device)
 cpu_regs = "0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"   # stock FDT /cpus reg list, boot CPU 0 first
 psci_method = "smc"                # stock FDT: enable-method = "psci", method = "smc"
-packed_data_ramdisk = true
+packed_data_ramdisk = false        # no Data ramdisk seed yet: DarwinBoot refuses a handover when the ADT declares a ramdisk slot we do not ship
 ipad_identity = true
 unique_chip_id = "required"        # the platform seed is not stored in any repository
 # root_match_volume_uuid omitted for bring-up: the OS volume UUID only exists after the
