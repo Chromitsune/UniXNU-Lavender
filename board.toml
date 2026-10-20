@@ -109,8 +109,8 @@ volume = "LAVENDERESP"
 size_mib = 192
 loader = "firmware"
 title = "lavender first boot: source 4K XNU to console"
-dram_size = "0x17e4c0000"          # sum of the two banks in the stock FDT memory node
-panic_screen = true                # patch panic() screen output into the payload copy of the kernel
+dram_size = "0xfe4c0000"           # size of the stock FDT memory span (0x80000000..0x17e4c0000), ~3.98 GiB
+panic_screen = false               # patcher offsets assume the full qualified kernel layout (legacy display on); revisit after NativeLegacyDisplay lands
 # trust_cache_sha256: same target image as sheng; pins added after first fetch
 trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
@@ -121,27 +121,22 @@ kernel_args = [
   "serial=3",
   "debug=0x14e",
   "kt_fixed_zones=120",
-  "boot-progress=2",
-  "-apfs_shared_datavolume",
-  "boot-ui-focus=PreBoard",
-  "boot-diag-resume=0",
   "-no_slto_panic",
-  # bring-up gates tuned for the eMMC board; extend as the stack converges
-  "offline-legacy-register=1",
   "offline-legacy-gop=1",
   "offline-hid-input=1",
-]
+]                  # first-boot bring-up set; the sheng board list is its converged stage-4 state
 
 [payload.adt]
 tool = "scripts/make-lavender-adt.py"
 chip_id = "207"
-owned_memory_size = "0x130000000"  # 4.75 GB DRAM: DarwinBoot takes a generous contiguous window
-root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+owned_memory_size = "0x30000000"   # 768 MB contiguous DarwinBoot window (fits in the 4 GB device)
 cpu_regs = "0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"   # stock FDT /cpus reg list, boot CPU 0 first
 psci_method = "smc"                # stock FDT: enable-method = "psci", method = "smc"
 packed_data_ramdisk = true
 ipad_identity = true
 unique_chip_id = "required"        # the platform seed is not stored in any repository
+# root_match_volume_uuid omitted for bring-up: the OS volume UUID only exists after the
+# userdata seeding step; add it (extracted from the seeded volume) before real-root boots.
 
 # Image parameters: AOSP v0 header, the values proven against Xiaomi's ABL by
 # make-bootimg.py/bootimg.cfg (the exact set that booted the phone first try).
