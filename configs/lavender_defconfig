@@ -19,7 +19,10 @@ CONFIG_XNU_SOURCE_MOCKFS=y
 CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
 CONFIG_XNU_VERIFIED_ROOT_PROBE=y
 CONFIG_XNU_OWNER_ROOT_AUDIT=y
-CONFIG_XNU_OWNER_ROOT_TRUST=y
+# OWNER_ROOT_TRUST off for first boot: the build gate requires a verified
+# native block driver (sheng pairs it with VirtioBlock; our NativeEmmc does
+# not exist yet). Audit + probe stay on; flip trust on with the eMMC driver.
+CONFIG_XNU_OWNER_ROOT_TRUST=n
 CONFIG_XNU_OWNER_CACHE_MOUNT=y
 CONFIG_XNU_OWNER_CACHE_STARTUP=y
 CONFIG_XNU_OWNER_BOOT_MANIFEST=y
