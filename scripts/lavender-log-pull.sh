@@ -49,6 +49,7 @@ if [ ! -s "$OUT" ]; then
 fi
 
 echo "--- $OUT ($(wc -c < "$OUT") bytes) ---"
-# The log is a byte ring: the newest text is at the end.
-tr -c '[:print:]\n' '.' < "$OUT" | tail -c 4000
+# The log is a byte ring: the newest text is at the end, and the ring can hold
+# bytes that are not text at all.
+LC_ALL=C tr -c '[:print:]\n' '.' < "$OUT" | LC_ALL=C tail -c 4000
 echo

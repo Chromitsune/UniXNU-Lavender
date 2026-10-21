@@ -224,7 +224,7 @@ _start:
   cmp  w10, #0
   b.le 9f
   ldr  x12, =ring
-  ldr  x13, [x12]            // total
+  ldr  x13, [x12, #8]        // the byte counter
   add  x14, x12, #HEADER
   mov  x16, x9
   mov  x8, x10
@@ -252,7 +252,7 @@ _start:
   mov  w9, w0
   and  w10, w0, #0xff
   ldr  x12, =ring
-  ldr  x13, [x12]            // total
+  ldr  x13, [x12, #8]        // the byte counter
   add  x14, x12, #HEADER
   ubfx x17, x13, #0, #BITS
   strb w10, [x14, x17]

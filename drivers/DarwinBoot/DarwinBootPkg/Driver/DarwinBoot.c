@@ -503,10 +503,16 @@ LogReadPrevious (
   if ((Loc.Magic != LOG_LOC_MAGIC) || (Ring == 0) || (Loc.Data == 0)) { goto Done; }
   if (!LogMapped (Ring, Ring + Loc.Total)) { goto Done; }
   mLogData = Loc.Data;
+  if (U64 ((VOID *)(UINTN)Ring) != LOG_RING_MAGIC) { goto Done; }
   Total = U64 ((VOID *)(UINTN)(Ring + 8));
-  if (Total > mLogData) { Total = mLogData; }
-  mLogStart = (UINTN)(Total & (mLogData - 1));
-  mLogLength = (UINTN)Total;
+  if (Total > mLogData) {
+    // The ring has wrapped: the oldest byte is where the counter is now.
+    mLogStart = (UINTN)(Total & (mLogData - 1));
+    mLogLength = (UINTN)mLogData;
+  } else {
+    mLogStart = 0;
+    mLogLength = (UINTN)Total;
+  }
   if (mLogLength == 0) { goto Done; }
   mLogPresent = TRUE;
   //
@@ -544,10 +550,11 @@ LogWriteNext (
 
   if (Ring == 0) { return; }
   //
-  // Nothing is written into the ring itself: the kernel owns it, and its
-  // byte counter starts at zero because the kernel's data segment is zeroed
-  // at boot.
+  // The ring belongs to the kernel, which owns the byte counter at +8 and the
+  // text at +0x40.  Only the magic at +0 is written here, so that the next
+  // boot can tell a real ring from whatever the memory happens to hold.
   //
+  WriteUnaligned64 ((UINT64 *)(UINTN)Ring, LOG_RING_MAGIC);
 
   ZeroMem (&Loc, sizeof (Loc));
   Loc.Magic = LOG_LOC_MAGIC;
