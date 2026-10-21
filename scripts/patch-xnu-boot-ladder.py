@@ -81,6 +81,18 @@ MILESTONES = [
 CAVE_SIZE = 0x80
 NOP = 0xD503201F
 
+# The paint runs inside the cave and uses x1..x6 (x1 is the frame buffer
+# cursor), so a displaced instruction that *reads* one of those registers would
+# run on the paint's leftovers.  Save the register into a scratch register
+# before painting and re-execute the instruction from there.
+#   msr TCR_EL1, x1 hit exactly this: the cave painted band 5 with x1 as the
+#   frame buffer pointer, then wrote that pointer into TCR_EL1, which made the
+#   first translated fetch take a level-0 translation fault and the exception
+#   vector recurse forever.
+PRESERVE = {
+    0xD5182041: ('x7', 0xD5182047, 'x1'),   # msr TCR_EL1, x1 -> msr TCR_EL1, x7
+}
+
 
 def load_segments(data):
     magic, _, _, _, ncmds = struct.unpack_from('<IiiII', data, 0)
@@ -316,8 +328,14 @@ def main():
                 symbols['global'] = target
             else:
                 body = PAINT.format(args='x20', band=band, lo=f'{lo:#x}', hi=f'{hi:#x}')
-            source = ('.text\n.global _start\n_start:\n' + body +
-                      f'  .word {word:#010x}\n' +
+            preamble = ''
+            displaced = word
+            if word in PRESERVE:
+                scratch, rewritten, saved = PRESERVE[word]
+                preamble = f'  mov {scratch}, {saved}\n'
+                displaced = rewritten
+            source = ('.text\n.global _start\n_start:\n' + preamble + body +
+                      f'  .word {displaced:#010x}\n' +
                       '  b target\n')
             code = assemble(source, cave_va, work, symbols)
             if len(code) > CAVE_SIZE:
