@@ -22,7 +22,8 @@ cp "$KERNEL" "$OUT"
 # panel is not mapped by the kernel's own tables yet (the early frame buffer
 # mapping patch is disabled, it used to destroy the bootstrap page tables).
 python3 "$ROOT/scripts/patch-xnu-entry-probe.py" "$OUT" --no-reset \
-  --boot-args 0xfffffff007167d18 --panic-cave 0xfffffff007a1e610
+  --boot-args 0xfffffff007167d18 --panic-cave 0xfffffff007a1e610 \
+  --post-mmu-band
 
 # The early boot: the MMU enable site belongs to the panic screen probe, so
 # the ladder starts after it.
@@ -42,5 +43,11 @@ if [ "${UNIXNU_C_LADDER:-0}" = 1 ]; then
     --site-at 0xfffffff0079afb20:PE_get_default \
     --site-at 0xfffffff0079afb74:arm_vm_init || echo "C ladder sites moved with the kernel build; skipped"
 fi
+
+# The console ring: the kernel appends every console byte to a ring in the
+# tail of its own window, and the next boot reads it back and prints it.
+# Applied after the ladders, because it checks that its caves are still in
+# zero padding.
+python3 "$ROOT/scripts/patch-xnu-log-ring.py" "$OUT"
 
 echo "instrumented kernel: $OUT"

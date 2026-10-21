@@ -13,6 +13,7 @@
   BootArgs.h
   BootVideo.h
   DiagFont.h
+  LogRing.h
   Entry.S
 
 [Packages]

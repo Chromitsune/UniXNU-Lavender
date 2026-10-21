@@ -14,6 +14,7 @@
 #include <Protocol/SimpleFileSystem.h>
 #include "BootArgs.h"
 #include "BootVideo.h"
+#include "LogRing.h"
 #include "PackedRamdisk.h"
 #include "WindowSize.h"
 
@@ -336,6 +337,234 @@ RunEnd (EFI_MEMORY_DESCRIPTOR *Map, UINTN Size, UINTN Stride, UINT64 Start, UINT
   return End;
 }
 
+//
+// Console ring.  See LogRing.h for the contract with the kernel patch.
+//
+// The ring is never copied whole: it is read straight out of RAM while the
+// previous boot's memory is still intact, and only the tail that goes on the
+// screen is kept in the driver.
+//
+STATIC CHAR8   mLogTail[LOG_TAIL + 1];
+STATIC UINTN   mLogLength;      // bytes of ring data in use
+STATIC UINTN   mLogStart;       // ring offset of the oldest byte
+STATIC UINT64  mLogData;        // the ring's data size, a power of two
+STATIC BOOLEAN mLogPresent;
+STATIC LOG_RING_DESC mRingDesc;
+
+// Find the ring that the kernel patch put in the image.  The loader cannot
+// know where it is: the kernel is rebuilt far more often than the loader is.
+STATIC
+BOOLEAN
+LogFindRing (
+  CONST UINT8    *Image,
+  UINTN          Size,
+  LOG_RING_DESC  *Desc
+  )
+{
+  UINTN  Index;
+
+  if (Size < sizeof (LOG_RING_DESC)) { return FALSE; }
+  for (Index = 0; Index + sizeof (LOG_RING_DESC) <= Size; Index++) {
+    if (Image[Index] != LOG_DESC_MAGIC[0]) { continue; }
+    if (CompareMem (Image + Index, LOG_DESC_MAGIC, sizeof (Desc->Magic)) != 0) { continue; }
+    CopyMem (Desc, Image + Index, sizeof (LOG_RING_DESC));
+    if ((Desc->Total <= LOG_RING_HEADER) || (Desc->Data == 0) ||
+        (Desc->Data > Desc->Total - LOG_RING_HEADER) ||
+        ((Desc->Data & (Desc->Data - 1)) != 0)) { return FALSE; }
+    return TRUE;
+  }
+  return FALSE;
+}
+
+// Is [Start, End) inside one descriptor the firmware will let us read?  A
+// corrupt location file must not send us into a hole or a device window.
+// The map is read into a stack buffer on purpose: this runs before the loader
+// allocates anything, so that the ring is copied out of RAM before a pool
+// allocation can land on it.
+STATIC
+BOOLEAN
+LogMapped (
+  UINT64  Start,
+  UINT64  End
+  )
+{
+  EFI_MEMORY_DESCRIPTOR  *Descriptor;
+  EFI_MEMORY_DESCRIPTOR  MapBuffer[96];
+  UINTN                   MapSize;
+  UINTN                   MapKey;
+  UINTN                   MapStride;
+  UINT32                  MapVersion;
+  EFI_STATUS              Status;
+  UINTN                   Offset;
+  BOOLEAN                 Mapped;
+
+  MapSize = sizeof (MapBuffer);
+  Status = gBS->GetMemoryMap (&MapSize, MapBuffer, &MapKey, &MapStride, &MapVersion);
+  if (EFI_ERROR (Status)) { return FALSE; }
+  Mapped = FALSE;
+  for (Offset = 0; Offset + MapStride <= MapSize; Offset += MapStride) {
+    Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)MapBuffer + Offset);
+    if (((Descriptor->Type == EfiConventionalMemory) || (Descriptor->Type == EfiLoaderCode) ||
+         (Descriptor->Type == EfiLoaderData) || (Descriptor->Type == EfiBootServicesCode) ||
+         (Descriptor->Type == EfiBootServicesData) || (Descriptor->Type == EfiRuntimeServicesCode) ||
+         (Descriptor->Type == EfiRuntimeServicesData) || (Descriptor->Type == EfiACPIReclaimMemory)) &&
+        (Descriptor->PhysicalStart <= Start) &&
+        (End <= Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages))) {
+      Mapped = TRUE;
+      break;
+    }
+  }
+  return Mapped;
+}
+
+STATIC
+UINT8
+LogByte (
+  UINT64  Ring,
+  UINTN   Index
+  )
+{
+  return *(UINT8 *)(UINTN)(Ring + LOG_RING_HEADER + ((mLogStart + Index) & (mLogData - 1)));
+}
+
+// Put the recovered log on the ESP, so it can be read off the phone without
+// booting it.  The ring is circular, so the text is two runs.
+STATIC
+VOID
+LogWriteArchive (
+  EFI_FILE_PROTOCOL  *Root,
+  UINT64             Ring
+  )
+{
+  EFI_FILE_PROTOCOL  *File;
+  EFI_STATUS         Status;
+  UINTN              Length;
+  UINTN              First;
+
+  File = NULL;
+  Status = Root->Open (Root, &File, L"\\EFI\\UniXNU\\bootlog.txt",
+                       EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
+  if (EFI_ERROR (Status)) { return; }
+  File->SetPosition (File, 0);
+  First = (UINTN)(mLogData - mLogStart);
+  if (First > mLogLength) { First = mLogLength; }
+  Length = First;
+  Status = File->Write (File, &Length, (VOID *)(UINTN)(Ring + LOG_RING_HEADER + mLogStart));
+  if (!EFI_ERROR (Status) && (mLogLength > First)) {
+    Length = mLogLength - First;
+    Status = File->Write (File, &Length, (VOID *)(UINTN)(Ring + LOG_RING_HEADER));
+  }
+  File->Close (File);
+}
+
+// Copy the log out of the previous boot's ring and leave it on the ESP.
+//
+// Only the physical address comes from a file; the bytes come from memory, so
+// this works even when the last boot died before it could write anything.
+//
+// Nothing here allocates: the ring is read before the loader asks for the
+// 50 MiB kernel image, because a pool allocation landing on the ring would
+// lose the log.
+STATIC
+VOID
+LogReadPrevious (
+  EFI_FILE_PROTOCOL  *Root
+  )
+{
+  EFI_FILE_PROTOCOL  *File;
+  EFI_STATUS         Status;
+  LOG_LOC_HEADER     Loc;
+  UINT8              InfoBuffer[sizeof (EFI_FILE_INFO) + 64];
+  EFI_FILE_INFO      *Info;
+  UINTN              InfoSize;
+  UINTN              Size;
+  UINT64             Ring;
+  UINT64             Total;
+  UINTN              Index;
+  UINTN              Tail;
+
+  mLogPresent = FALSE;
+  mLogLength = 0;
+  mLogStart = 0;
+  File = NULL;
+  Status = Root->Open (Root, &File, L"\\EFI\\UniXNU\\ring.loc", EFI_FILE_MODE_READ, 0);
+  if (EFI_ERROR (Status)) { goto Done; }
+  // The file information includes the name, so the buffer has to be larger
+  // than the structure itself.
+  Info = (EFI_FILE_INFO *)InfoBuffer;
+  ZeroMem (InfoBuffer, sizeof (InfoBuffer));
+  InfoSize = sizeof (InfoBuffer);
+  Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
+  if (EFI_ERROR (Status) || (Info->FileSize < sizeof (LOG_LOC_HEADER))) { goto Done; }
+  Size = sizeof (Loc);
+  Status = File->Read (File, &Size, &Loc);
+  if (EFI_ERROR (Status) || (Size != sizeof (Loc))) { goto Done; }
+  Ring = Loc.Ring;
+  if ((Loc.Magic != LOG_LOC_MAGIC) || (Ring == 0) || (Loc.Data == 0)) { goto Done; }
+  if (!LogMapped (Ring, Ring + Loc.Total)) { goto Done; }
+  mLogData = Loc.Data;
+  Total = U64 ((VOID *)(UINTN)(Ring + 8));
+  if (Total > mLogData) { Total = mLogData; }
+  mLogStart = (UINTN)(Total & (mLogData - 1));
+  mLogLength = (UINTN)Total;
+  if (mLogLength == 0) { goto Done; }
+  mLogPresent = TRUE;
+  //
+  // The tail is all that goes on the screen; the whole log is written to the
+  // ESP below, straight out of RAM.
+  //
+  Tail = (mLogLength < LOG_TAIL) ? mLogLength : (UINTN)LOG_TAIL;
+  for (Index = 0; Index < Tail; Index++) {
+    UINT8 Byte = LogByte (Ring, mLogLength - Tail + Index);
+    if (((Byte < 32) || (Byte > 126)) && (Byte != '\n') && (Byte != '\r') && (Byte != '\t')) { Byte = '.'; }
+    mLogTail[Index] = (CHAR8)Byte;
+  }
+  mLogTail[Tail] = 0;
+  LogWriteArchive (Root, Ring);
+Done:
+  if (File != NULL) { File->Close (File); }
+  if (!mLogPresent) { mLogTail[0] = 0; }
+}
+
+// Hand the next boot the location of the ring that is about to go live.  Called
+// once the window is known and before the volume is closed.
+STATIC
+VOID
+LogWriteNext (
+  EFI_FILE_PROTOCOL  *Root,
+  UINT64             Ring,
+  UINT64             Total,
+  UINT64             Data
+  )
+{
+  EFI_FILE_PROTOCOL  *File;
+  EFI_STATUS         Status;
+  LOG_LOC_HEADER     Loc;
+  UINTN              Length;
+
+  if (Ring == 0) { return; }
+  //
+  // Nothing is written into the ring itself: the kernel owns it, and its
+  // byte counter starts at zero because the kernel's data segment is zeroed
+  // at boot.
+  //
+
+  ZeroMem (&Loc, sizeof (Loc));
+  Loc.Magic = LOG_LOC_MAGIC;
+  Loc.Version = LOG_LOC_VERSION;
+  Loc.Ring = Ring;
+  Loc.Total = Total;
+  Loc.Data = Data;
+  File = NULL;
+  Status = Root->Open (Root, &File, L"\\EFI\\UniXNU\\ring.loc",
+                       EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
+  if (EFI_ERROR (Status)) { return; }
+  File->SetPosition (File, 0);
+  Length = sizeof (Loc);
+  Status = File->Write (File, &Length, (VOID *)&Loc);
+  File->Close (File);
+}
+
 // Large diagnostic text straight into the GOP framebuffer: the UEFI text console font is too small to
 // photograph. 5x12 glyphs from DiagFont.h scaled 4x, white on a black box; wraps at the right edge.
 #include "DiagFont.h"
@@ -468,6 +697,8 @@ Boot (
   UINT64                          TreeAddress;
   UINT64                          Used;
   UINT64                          WindowSize;
+  UINT64                          Ring;
+  LOG_RING_DESC                   RingDesc;
   UINT64                          RamdiskAddress;
   UINTN                           RamdiskOffset;
   UINTN                           RamdiskBytes;
@@ -516,10 +747,24 @@ Boot (
   if (EFI_ERROR (Status)) { return Status; }
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
+  LogReadPrevious (Root);
   Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
   if (EFI_ERROR (Status)) { goto Fail; }
   Status = ParseKernel (Image, ImageSize, &Kernel);
   if (EFI_ERROR (Status)) { goto Fail; }
+  //
+  // The console ring, if this kernel carries one: a hole in the kernel's own
+  // data that the kernel appends its console output to, and that the next
+  // boot reads back.
+  //
+  ZeroMem (&RingDesc, sizeof (RingDesc));
+  Ring = 0;
+  if (LogFindRing ((CONST UINT8 *)Image, ImageSize, &RingDesc)) {
+    mRingDesc = RingDesc;
+    if ((RingDesc.Ring >= Kernel.Base) && (RingDesc.Ring - Kernel.Base < Kernel.End - Kernel.Base)) {
+      Ring = RingDesc.Ring - Kernel.Base;   // the offset into the window
+    }
+  }
   Length = StrSize (Request->KernelPath);
   TreePath = AllocatePool (Length + 11 * sizeof (CHAR16));
   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
@@ -573,6 +818,12 @@ Boot (
     CopyMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
              (UINT8 *)Image + Kernel.Segments[Index].FileOffset, (UINTN)Kernel.Segments[Index].FileSize);
   }
+  //
+  // The console ring lives in the kernel's own data, so that it is still
+  // mapped after the kernel replaces its page tables.  Its header goes in
+  // after the image is copied, or the copy would wipe it.
+  //
+  if (Ring != 0) { LogWriteNext (Root, Address + Ring, RingDesc.Total, RingDesc.Data); }
   Args = (DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress;
   Args->Revision = 2;
   Args->Version = 2;
@@ -636,10 +887,20 @@ Boot (
   //
   DEBUG ((DEBUG_ERROR, "args virt=0x%lx phys=0x%lx mem=0x%lx top=0x%lx flags=0x%lx\n",
           Args->VirtualBase, Args->PhysicalBase, Args->MemorySize, Args->TopOfKernelData, Args->BootFlags));
+  DEBUG ((DEBUG_ERROR, "log ring 0x%lx  previous log %a (%lu bytes)\n",
+          (Ring != 0) ? Address + Ring : 0, mLogPresent ? "found" : "none", (UINT64)mLogLength));
   DEBUG ((DEBUG_ERROR, "TTBR0_EL1 0x%lx  TTBR1_EL1 0x%lx  sctlr after disable 0x%lx\n",
           READ_SYSREG (ttbr0_el1), READ_SYSREG (ttbr1_el1),
           READ_SYSREG (sctlr_el1) & ~((UINT64)((1 << 0) | (1 << 2) | (1 << 12)))));
   DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmeans the kernel entry code ran.\n"));
+  if (mLogPresent) {
+    //
+    // The log from the last boot.  It is printed last so that it is what stays
+    // on screen: the kernel paints its bands over the top of the display, and
+    // everything below them is what a photograph can still show.
+    //
+    DEBUG ((DEBUG_ERROR, "\n--- previous boot log, %lu bytes ---\n%a\n", (UINT64)mLogLength, mLogTail));
+  }
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);

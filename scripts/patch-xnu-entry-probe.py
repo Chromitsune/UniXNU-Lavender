@@ -13,6 +13,12 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         that time shows the CPU got through the
                                         MMU enable; the frame buffer is not
                                         mapped by then, so time is the signal.
+  post-MMU band (--post-mmu-band)       a white bar painted just after the MMU is
+                                        on: the cave turns the MMU off at its
+                                        physical alias, paints the physical frame
+                                        buffer, turns the MMU on again and
+                                        continues. Seeing the bar means the CPU
+                                        executed with translation enabled.
   panic screen (--panic-screen)         panic() and its common panic funnel draw
                                         their format string on the
                                         kernel's own frame buffer mapping and
@@ -46,7 +52,12 @@ PANIC_VA = 0xFFFFFFF00BF69B04      # _panic
 VINFO_VA = 0xFFFFFFF00C0A2970      # _vinfo
 PANIC_CAVE_END = 0xFFFFFFF00B9D0FF0
 CAVE_SIZE = 0x60
-CAVES = {1: 0xFFFFFFF00B9D0500, 2: 0xFFFFFFF00B9D0560, 3: 0xFFFFFFF00B9D05C0, 4: 0xFFFFFFF00B9D0620}
+CAVES = {1: 0xFFFFFFF00B9D0500, 2: 0xFFFFFFF00B9D0560, 3: 0xFFFFFFF00B9D05C0, 4: 0xFFFFFFF00B9D0620,
+         5: 0xFFFFFFF00B9D0680}
+# Stage 5 runs with the MMU on, where the panel is still unmapped, so it is
+# larger than the reset/bar caves (it drops the MMU at a physical alias, paints
+# and turns the MMU back on).
+STAGE_SIZE = {1: CAVE_SIZE, 2: CAVE_SIZE, 3: CAVE_SIZE, 4: CAVE_SIZE, 5: 0x200}
 TIMEBASE = 19200000
 BOOT_ARGS = 0        # the kernel's copy of the boot arguments (panic screen fallback)
 
@@ -119,6 +130,35 @@ _start:
 """ + ".ltorg\n",
 }
 
+# Stage 5 runs where the MMU is already on, but the panel sits outside the
+# bootstrap identity map, so the frame buffer cannot be written through the
+# kernel's mappings yet.  Paint through the physical alias instead:
+#   1. remember SCTLR, clear the M bit,
+#   2. branch to the same code at its physical address (mapped 1:1),
+#   3. turn the MMU off, paint the band into the physical frame buffer,
+#   4. turn the MMU on again and continue where the probe displaced.
+# If the band appears, the CPU executed with translation on (the fetch after
+# `msr SCTLR_EL1` and the branch that reached this cave); if not, it died in
+# the first moments after the MMU came up.
+SOURCES[5] = ("""
+.text
+.global _start
+_start:
+  mrs x8, sctlr_el1
+  bic x9, x8, #1
+  adr x10, 1f
+  br x10
+  .org 0x40
+1:
+  msr sctlr_el1, x9
+  isb
+""" + PAINT.format(args='x20', band='{band}', lo='{lo}', hi='{hi}') + """
+  msr sctlr_el1, x8
+  isb
+  mov x0, #0x300000
+  b target
+""")
+
 RESET_BEFORE = """.text
 .global _start
 _start:
@@ -132,8 +172,6 @@ _start:
   wfe
   b 1b
 """
-
-
 def kernel_symbols(kernel):
     """Address -> name for the kernel's symbols, from llvm-nm."""
     nm = shutil.which('llvm-nm') or '/opt/homebrew/opt/llvm/bin/llvm-nm'
@@ -398,6 +436,8 @@ def main():
     parser.add_argument('--reset-before', action='store_true', help='reset at the call site before invoking SYMBOL (requires --reset-after)')
     parser.add_argument('--panic-screen', action='store_true', help='draw panic() messages on the screen')
     parser.add_argument('--no-reset', action='store_true', help='no reset probe at all')
+    parser.add_argument('--post-mmu-band', action='store_true',
+                        help='paint a white bar just after the MMU is on (drops the MMU at a physical alias to reach the panel)')
     parser.add_argument('--occurrence', type=int, default=1, help='which call to SYMBOL (1 = first)')
     parser.add_argument('--boot-args', type=lambda value: int(value, 0),
                         help='the address of the kernel\'s copy of the boot arguments')
@@ -435,19 +475,34 @@ def main():
     else:
         sites.append((AFTER_MMU_VA, 3, {'target': AFTER_MMU_VA + 4}))
         description = f'stage 3 reset {args.reset_delay} s after the MMU is on'
+    if args.post_mmu_band:
+        sites.append((AFTER_MMU_VA, 5, {'target': AFTER_MMU_VA + 4}))
+        description += ', post-MMU white bar'
 
     with tempfile.TemporaryDirectory() as tmp:
         for site, stage, symbols in sites:
-            source = RESET_BEFORE if (stage == 4 and args.reset_before) else SOURCES[stage].format(ticks=TIMEBASE * args.reset_delay)
+            if stage == 5:
+                # Everything is relative.  The prologue branch runs before the
+                # kernel constructs a KVA, so the cave is executing at its
+                # physical alias already (the V=P identity map): `adr` gives the
+                # address to switch the MMU off at, and `b target` resumes at the
+                # identity alias of the displaced instruction.  No absolute
+                # addresses, so a loader slide (the phone and QEMU disagree on
+                # the base) cannot break it.
+                source = SOURCES[5].format(band=3, lo='0xFFFF', hi='0xFFFF')
+            else:
+                source = RESET_BEFORE if (stage == 4 and args.reset_before) else SOURCES[stage].format(ticks=TIMEBASE * args.reset_delay)
             code = assemble(source, CAVES[stage], symbols, Path(tmp))
-            if len(code) > CAVE_SIZE:
+            if len(code) > STAGE_SIZE[stage]:
                 raise SystemExit(f'Stage {stage} code is too large')
+            if not padded_clear(data, file_offset(CAVES[stage]), STAGE_SIZE[stage]):
+                raise SystemExit(f'Padding after stage {stage} is not empty')
             data[file_offset(CAVES[stage]):file_offset(CAVES[stage]) + len(code)] = code
     for site, stage, _ in sites:
         struct.pack_into('<I', data, file_offset(site), branch(site, CAVES[stage]))
     if args.panic_screen:
         # Right after the last probe cave in use, so the padding is shared as tightly as possible.
-        PANIC_CAVE = max(CAVES[stage] for _, stage, _ in sites) + CAVE_SIZE
+        PANIC_CAVE = max(CAVES[stage] + STAGE_SIZE[stage] for _, stage, _ in sites)
         panic_limit = PANIC_CAVE_END
         if args.panic_cave:
             # A different kernel has a different padding layout: use the given
