@@ -41,7 +41,7 @@ PAINT = """
   stp w6, w6, [x4], #8
   subs x5, x5, #1
   b.hi 2b
-  add x1, x1, x4
+  add x1, x1, x2, lsl #3
   subs x3, x3, #1
   b.hi 1b
   dsb sy
