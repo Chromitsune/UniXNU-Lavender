@@ -17,7 +17,7 @@ and properties the source XNU boot converged on) with real pinned Redmi Note 7
 This is first-boot bring-up data: the platform has no matching platform expert
 yet, so the kernel is expected to reach the video console and report the
 genuine missing-driver panic on screen. No Apple device identity is claimed
-unless --ipad-identity is passed, and no property is invented beyond these
+unless --iphone-identity is passed, and no property is invented beyond these
 pinned sources.
 """
 from pathlib import Path
@@ -96,9 +96,9 @@ def main():
     parser.add_argument('--unique-chip-id', type=lambda value: int(value, 16), default=None,
                         help='/chosen/unique-chip-id (8 bytes) and --chip-id (4 bytes) seed XNU IOPlatformUUID; software identity seeds, not Apple silicon IDs')
     parser.add_argument('--chip-id', type=lambda value: int(value, 16), default=None)
-    parser.add_argument('--ipad-identity', action='store_true',
-                        help='/product and /buttons describe an iPad-class device without a Home button (MobileGestalt reads these from the tree); '
-                             'values follow the unchanged iPad7,1 tree, the panel geometry and button set are lavender\'s')
+    parser.add_argument('--iphone-identity', action='store_true',
+                        help='/product and /buttons describe an iPhone X-class device without a Home button (MobileGestalt reads these from the tree); '
+                             'values follow the iPhone10,3 (D22AP) tree, the panel geometry is lavender\'s')
     parser.add_argument('--cpu-regs', default='0',
                         help='Comma-separated physical MPIDR affinity values (the raw value each core reads from MPIDR_EL1, '
                              'verified against it at startup by the ArmCpu driver and passed verbatim to PSCI CPU_ON). '
@@ -152,9 +152,9 @@ def main():
             for index, (reg, compat) in enumerate(zip(cpu_regs, core_compatible))]
     tree = node('device-tree', [
         # hw.product/hw.machine/hw.target come from the root 'model'/'target-type' (IODTPlatformExpert);
-        # libMobileGestalt prefix-matches hw.product against iPhone/iPod/iPad, so the iPad identity needs both here.
-        ('model', b'iPad7,1\0' if args.ipad_identity else b'lavender-first-boot\0'),
-        *([('target-type', b'J120\0')] if args.ipad_identity else []),
+        # libMobileGestalt prefix-matches hw.product against iPhone/iPod/iPad, so the iPhone X identity needs both here.
+        ('model', b'iPhone10,3\0' if args.iphone_identity else b'lavender-first-boot\0'),
+        *([('target-type', b'D22\0'), ('target-sub-type', b'D22AP\0')] if args.iphone_identity else []),
         # Root compatible strings of the stock board DT (xiaomi,lavender / qcom,sdm660).
         ('compatible', b'xiaomi,lavender\0qcom,sdm660\0'),
         ('#address-cells', struct.pack('<I', 2)),
@@ -173,14 +173,14 @@ def main():
                         # baseband). Values established on hardware by github.com/dipa-studio/ios-sweet (tools/mkadt.py).
                         *([('certificate-production-status', struct.pack('<I', 0)), ('effective-production-status-ap', struct.pack('<I', 0)),
                            ('certificate-security-mode', struct.pack('<I', 1)), ('effective-security-mode-sep', struct.pack('<I', 1))]
-                          if args.ipad_identity else []),
+                          if args.iphone_identity else []),
                         # This property describes the actual volatile Data RAM disk.
                         *([('ephemeral-storage', struct.pack('<I', 1))] if (args.data_ramdisk or args.packed_data_ramdisk) else []),
                         *( [('darwinboot-memory-size', struct.pack('<Q', args.owned_memory_size))]
                            if args.owned_memory_size else [] ),
                         ('dram-base', struct.pack('<Q', DRAM_BASE)),
                         ('dram-size', struct.pack('<Q', args.dram_size)),
-                        # Image4 hash algorithm. The target iPad's DT specifies sha2-384 in /chosen; this
+                        # Image4 hash algorithm. The target iPhone X's DT specifies sha2-384 in /chosen; this
                         # selects the algorithm only and asserts nothing about Apple silicon or fuses.
                         ('crypto-hash-method', b'sha2-384\0'),
                         *( [('root-matching', ('<dict><key>IOProviderClass</key><string>IOMedia</string>'
@@ -207,18 +207,21 @@ def main():
                              # No 'menu' entry: the phone has no Home button. 2 = the non-mechanical answer
                              # BSPlatform passes through (volume-down + seeded AssistiveTouch replaces Home later).
                              ('button-names', b'hold\0voldown\0volup\0'),
-                             ('home-button-type', struct.pack('<I', 2))])] if args.ipad_identity else [] ),
-        node('product', [('product-name', b'iPad Pro (12.9-inch) (2nd generation)\0' if args.ipad_identity else b'Xiaomi Redmi Note 7\0'),
+                             ('home-button-type', struct.pack('<I', 2))])] if args.iphone_identity else [] ),
+        node('product', [('product-name', b'iPhone X\0' if args.iphone_identity else b'Xiaomi Redmi Note 7\0'),
                          ('model', b'xiaomi,lavender\0'),
-                         *( [('product-description', b'iPad Pro (12.9-inch) (2nd generation)\0'),
+                         *( [('product-description', b'iPhone X\0'),
                              # Display geometry stays the phone's own; MobileGestalt recovery is a post-boot
-                             # toy, not critical-path (see notes/lavender-port-plan.md).
-                             ('artwork-device-idiom', b'pad\0'),
-                             ('artwork-device-subtype', struct.pack('<I', 2732)),
-                             ('artwork-scale-factor', struct.pack('<I', 2)),
-                             ('artwork-display-gamut', b'P3\0'),
-                             ('compatible-device-fallback', b'iPad6,7\0'),
-                             ('thin-bezel', struct.pack('<I', 1))] if args.ipad_identity else [] )]),
+                             # toy, not critical-path (see notes/lavender-port-plan.md). 2436 = the 19.5:9
+                             # screen height in pixels, 3x = the iPhone X scale.
+                             ('artwork-device-idiom', b'phone\0'),
+                             ('artwork-device-subtype', struct.pack('<I', 2436)),
+                             ('artwork-scale-factor', struct.pack('<I', 3)),
+                             # ios-sweet measured that P3 here makes SpringBoard take the extended-gamut
+                             # path on an sRGB panel; the iPhone X tree says P3, the panel is sRGB.
+                             ('artwork-display-gamut', b'sRGB\0'),
+                             ('compatible-device-fallback', b'iPhone10,6\0'),
+                             ('thin-bezel', struct.pack('<I', 1))] if args.iphone_identity else [] )]),
         node('arm-io', [('device_type', b'arm-io\0'),
                         ('#address-cells', struct.pack('<I', 2)),
                         ('#size-cells', struct.pack('<I', 2)),

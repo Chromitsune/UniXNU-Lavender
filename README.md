@@ -1,7 +1,7 @@
 # UniXNU-lavender
 
 Device repository for the **Xiaomi Redmi Note 7** (`lavender`, Qualcomm SDM660)
-on [UniXNU](https://github.com/unixnu/UniXNU) — iPadOS/iOS on a 2019-era Android
+on [UniXNU](https://github.com/unixnu/UniXNU) — iOS on a 2019-era Android
 phone, loaded through the phone's own bootloader and storage.
 
 ## Board realities (all pinned from the phone itself)
@@ -35,7 +35,7 @@ initrd, entry variables) and the fixture payload already **pass on the device**
    contract with SDM660 values)
 5. [ ] Phase 4 — real XNU: needs full Xcode (`iphoneos` SDK) on the build Mac;
    kernel build via `./unixnu build kernel`, prelink against the unchanged
-   iPad7,1 iPadOS 17.7.11 kernelcache, then DarwinBoot handover on the phone
+   iPhone10,3 iOS 16.7.16 (20H392) kernelcache, then DarwinBoot handover on the phone
 6. [ ] Phase 5 — storage: `NativeEmmc` kernel driver (qcom,sdhci-msm-v5,
    4K pages); until then the RAM block root carries bring-up
 7. [ ] Phase 6 — display/touch: NT36672A panel + Novatek touch (SEVNative ->

@@ -44,7 +44,10 @@ CONFIG_XNU_NATIVE_ARCH_TIMER=y
 # that traps as an undefined instruction on the phone. QEMU (cortex-a76) has PAN,
 # so it would never catch this - verified on the actual hardware by the ios-topaz
 # bring-up on identical Kryo 260 cores (their patch 0081 'no LSE, no PAN').
-# The prelinked iPadOS kernelcache is v8.0-safe (0 LSE sites in its 2.1M instrs).
+# The prelinked kernelcache is the iPhone X 20H392 one. Its own kernel text
+# (__TEXT_EXEC,__text) holds ~16.6k LSE sites because the A11 is ARMv8.2; UniXNU
+# replaces that text with our source kernel, which is built v8.0-safe. The kept
+# kext text still needs a targeted LSE re-audit before the kext-loading stage.
 CONFIG_XNU_NATIVE_PAN=n
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=n
 

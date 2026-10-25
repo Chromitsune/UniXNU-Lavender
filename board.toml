@@ -8,23 +8,25 @@ soc = "SDM660"
 description = "Xiaomi Redmi Note 7 (eMMC, 4 GB DRAM, 1080x2340 panel)"
 kit = "lavender"                   # the package/ of this repository appears as kits/lavender in the build tree
 
-# The target OS image: the unchanged iPad7,1 iPadOS 17.7.11 restore image (same
-# pin as the sheng reference board, so the fetched components are shared).
+# The target OS image: the unchanged iPhone X (iPhone10,3 / D22AP, A11) iOS
+# 16.7.16 restore image -- the target the other Kryo-260-class ports use, so the
+# original userland and kexts are the well-trodden ones.
 # Give --ipsw PATH to use a local file; without it the remote url is read with
 # range requests, only the members that are needed.
 [ipsw]
-url = "https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw"
-product = "iPad7,1"
-version = "17.7.11"
-build = "21H461"
-device_class = "j120ap"
-chip_id = 0x8011
-board_id = 12
+url = "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
+product = "iPhone10,3"
+version = "16.7.16"
+build = "20H392"
+device_class = "d22ap"
+chip_id = 0x8015                  # A11 / t8015
+board_id = 6                      # BuildManifest ApBoardID of the d22ap Erase identity
 fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustCache"]
 
-[ipsw.sha256]
-"044-76040-038.dmg" = "3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d"
-"044-76034-038.dmg" = "b4908cde41d23e6bc05e6af51a2c9eeb00cf0f863a6a18b1600c96a3fd70414f"
+# Member pins are optional; the OS/SystemOS dmgs of this image are multi-GB and
+# are hashed when the userdata step is first run (add the entries then):
+#   087-86698-044.dmg  (OS)
+#   087-86593-047.dmg  (Cryptex1,SystemOS)
 
 # The raw image for the userdata partition: the OS and SystemOS disk images of
 # the IPSW behind a manifest. first_lba/last_lba are the GPT entry "userdata" of
@@ -44,9 +46,14 @@ defconfig = "lavender_defconfig"
 [kernel.prelink]
 tool = "kits/NativePrelink/emit_prelink.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
-kernelcache_sha256 = "f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7"
+kernelcache_sha256 = "2ec297bac95bcba01046fd0148e97e7e5885c05a6c18827f39f534ba375c1221"
 slide = "-0x1000000"
-early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0xfffffff005ab4ae0"
+# early_security_init: omitted for the iPhone X. The value must point at the
+# original AppleMobileFileIntegrity initializer inside *this* kernelcache's
+# executable segment; the 21H461 value does not land on an instruction boundary
+# in 20H392, so it cannot be carried over. Derive it from the fetched
+# out/ipsw/20H392/kernelcache.decompressed before the kext-loading stage.
+# early_security_init = "com.apple.driver.AppleMobileFileIntegrity=0x..."
 roots = [
   "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib",
   "com.apple.driver.AppleARMPlatform",
@@ -111,10 +118,11 @@ loader = "payload"                # our phone firmware has no DarwinBoot in its 
 title = "lavender first boot: source 4K XNU to console"
 dram_size = "0xfe4c0000"           # size of the stock FDT memory span (0x80000000..0x17e4c0000), ~3.98 GiB
 panic_screen = false               # patcher offsets assume the full qualified kernel layout (legacy display on); revisit after NativeLegacyDisplay lands
-# trust_cache_sha256: same target image as sheng; pins added after first fetch
+# trust_cache_sha256: sha256 of the iPhone X 20H392 StaticTrustCache and
+# Cryptex1,SystemTrustCache members (derived from the IPSW).
 trust_cache_sha256 = [
-  "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
-  "8900d6a93d7a59ce1a872a5c081e559f4240a218f97e12d44d22dda46644d68f",
+  "63e01c03b31e1532a5581a24865490673f0b5c297b0199fe0095637c6100ef4b",
+  "9cc478fe3525e2683b5b9ea1eea0851eaebebdab21d206556233400e59d2e361",
 ]
 kernel_args = [
   "-v",
@@ -128,12 +136,12 @@ kernel_args = [
 
 [payload.adt]
 tool = "scripts/make-lavender-adt.py"
-chip_id = "207"
+chip_id = "0x8015"                 # A11, what the iPhone X userland expects
 owned_memory_size = "0x30000000"   # 768 MB contiguous DarwinBoot window (fits in the 4 GB device)
 cpu_regs = "0,0x1,0x2,0x3,0x100,0x101,0x102,0x103"   # stock FDT /cpus reg list, boot CPU 0 first
 psci_method = "smc"                # stock FDT: enable-method = "psci", method = "smc"
 packed_data_ramdisk = false        # no Data ramdisk seed yet: DarwinBoot refuses a handover when the ADT declares a ramdisk slot we do not ship
-ipad_identity = true
+iphone_identity = true
 unique_chip_id = "required"        # the platform seed is not stored in any repository
 # root_match_volume_uuid omitted for bring-up: the OS volume UUID only exists after the
 # userdata seeding step; add it (extracted from the seeded volume) before real-root boots.
