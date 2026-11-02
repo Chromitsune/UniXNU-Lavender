@@ -42,6 +42,7 @@ windows = [
 
 [kernel]
 defconfig = "lavender_defconfig"
+darwin_version = "22.6.0"        # Must match the iOS 16.7.16 (20H392) kernelcache ABI.
 
 [kernel.prelink]
 tool = "kits/NativePrelink/emit_prelink.py"

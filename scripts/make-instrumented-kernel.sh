@@ -16,6 +16,7 @@ if [ ! -f "$KERNEL" ]; then
   echo "no built kernel at $KERNEL" >&2
   exit 1
 fi
+python3 "$ROOT/scripts/check-kernel-darwin-version.py" "$KERNEL" --board "$ROOT/board.toml"
 
 cp "$KERNEL" "$OUT"
 # The panic screen is deliberately left out: it runs with the MMU on, where the

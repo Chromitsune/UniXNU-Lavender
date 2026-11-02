@@ -33,6 +33,7 @@ for file in "$KERNEL" "$BOOTAA64" "$DARWINBOOT"; do
     exit 1
   fi
 done
+python3 "$ROOT/scripts/check-kernel-darwin-version.py" "$KERNEL" --board "$ROOT/board.toml"
 
 cd "$UNIXNU"
 rm -f out/lavender/payload/payload.img out/lavender/payload/payload.json
