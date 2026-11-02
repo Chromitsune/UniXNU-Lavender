@@ -18,7 +18,7 @@ git = "https://github.com/apple-oss-distributions/IOStorageFamily.git"
 ref = "main"
 commit = "e45fbe30a7879e0b16e26dddb78538f1b00e0bff"
 
-# The matching Darwin 23 pthread component, registered by the source-pthread
+# The matching Darwin 22 pthread component, registered by the source-pthread
 # bootstrap patch.
 [[source]]
 name = "libpthread"

@@ -1,0 +1,33 @@
+diff --git a/bsd/sys/mount.h b/bsd/sys/mount.h
+--- a/bsd/sys/mount.h
++++ b/bsd/sys/mount.h
+@@ -1279,6 +1279,7 @@
+  *  @return Mountpoint if found, else NULL.  Note unmounting mountpoints can be returned.
+  */
+ mount_t vfs_getvfs(fsid_t *fsid);
++mount_t vfs_getvfs_with_vfsops(fsid_t *fsid, const struct vfsops *ops);
+ 
+ /*!
+  *  @function vfs_mountedon
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -1945,6 +1945,18 @@
+ 	return mount_list_lookupby_fsid(fsid, 0, 0);
+ }
+ 
++/* Compatibility export for the iOS 16.7.16 (Darwin 22) kernelcache ABI. */
++mount_t
++vfs_getvfs_with_vfsops(fsid_t *fsid, const struct vfsops *ops)
++{
++	mount_t mp = vfs_getvfs(fsid);
++
++	if (mp != NULL && mp->mnt_op != ops) {
++		mp = NULL;
++	}
++	return mp;
++}
++
+ static struct mount *
+ vfs_getvfs_locked(fsid_t *fsid)
+ {

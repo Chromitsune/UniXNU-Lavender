@@ -29,10 +29,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-CNPUTS = 0xFFFFFFF0073B6B30       # __cnputs(char *c, int size, bool poll)
-CNPUTS_WORD = 0xD10203FF          # sub sp, sp, #128
-UNBUFFERED = 0xFFFFFFF0073B6C60   # console_write_unbuffered(char c)
-UNBUFFERED_WORD = 0xD10103FF      # sub sp, sp, #0x40
+CNPUTS = 0                     # resolved from this kernel's symbol table
+CNPUTS_WORD = 0xD10203FF         # sub sp, sp, #128
+UNBUFFERED = 0                   # resolved from this kernel's symbol table
+UNBUFFERED_WORD = 0xD10103FF     # sub sp, sp, #0x40
 
 # Ring geometry.  Keep in sync with DarwinBoot's LogRing.h.
 RING_HEADER = 0x40
@@ -48,12 +48,15 @@ RING_HOLE = 0x10000
 DESC_MAGIC = b"LAVLOCRINGDESC1\x00"
 DESC_SIZE = 0x30
 
-# Caves live in the zero padding after the entry point.  The boot ladder uses
-# [0x7a1de30, 0x7a1e230); the panic screen is at 0x7a1e610.
-CAVE_LOG = 0xFFFFFFF007A1E800
-CAVE_CHAR = 0xFFFFFFF007A1EA00
-CAVE_DESC = 0xFFFFFFF007A1EC00
-CAVE_LIMIT = 0xFFFFFFF007A20000
+# Place caves dynamically in remaining __TEXT_EXEC zero/NOP padding.  On
+# Darwin 22 the old Darwin 23 absolute addresses fall in __DATA (NX).
+CAVE_LOG = 0
+CAVE_CHAR = 0
+CAVE_DESC = 0
+CAVE_LIMIT = 0
+CAVE_LOG_SIZE = 0x200
+CAVE_CHAR_SIZE = 0x100
+CAVE_DESC_SIZE = DESC_SIZE
 
 SEGMENTS = []
 
@@ -105,9 +108,46 @@ def assemble(source, va, workdir, symbols):
     return binary.read_bytes()
 
 
-def padded_zero(data, va, length):
+def padded_code(data, va, length):
+    """True only for full words of zero/NOP padding in a file-backed segment."""
+    if length <= 0 or length % 4:
+        return False
     at = file_offset(va)
-    return all(byte == 0 for byte in data[at:at + length])
+    if at + length > len(data):
+        return False
+    return all(struct.unpack_from('<I', data, offset)[0] in (0, 0xD503201F)
+               for offset in range(at, at + length, 4))
+
+
+def find_code_cave(data, required):
+    """Find the largest remaining executable zero/NOP run after earlier probes."""
+    best = None
+    for name, vmaddr, vmsize, fileoff, filesize in SEGMENTS:
+        if name != '__TEXT_EXEC' or not filesize:
+            continue
+        end = fileoff + min(vmsize, filesize)
+        offset = fileoff
+        while offset + 4 <= end:
+            word = struct.unpack_from('<I', data, offset)[0]
+            if word not in (0, 0xD503201F):
+                offset += 4
+                continue
+            start = offset
+            while offset + 4 <= end and struct.unpack_from('<I', data, offset)[0] in (0, 0xD503201F):
+                offset += 4
+            length = offset - start
+            if length >= required and (best is None or length > best[0]):
+                best = (length, vmaddr + start - fileoff)
+    if best is None:
+        raise SystemExit(f'no executable zero/NOP cave of {required:#x} bytes')
+    return best[1], best[0]
+
+
+def unique_symbol(symbols, name):
+    addresses = sorted({address for address, symbol in symbols if symbol == name})
+    if len(addresses) != 1:
+        raise SystemExit(f'expected one {name} symbol, found {len(addresses)}: {addresses}')
+    return addresses[0]
 
 
 def load_symbols(data):
@@ -278,8 +318,17 @@ def main():
     parser.add_argument('-o', '--output', type=Path, help='write here instead of in place')
     args = parser.parse_args()
 
+    global CNPUTS, UNBUFFERED, CAVE_LOG, CAVE_CHAR, CAVE_DESC, CAVE_LIMIT
     data = bytearray(args.kernel.read_bytes())
     load_segments(data)
+    symbols = load_symbols(data)
+    CNPUTS = unique_symbol(symbols, '__cnputs')
+    UNBUFFERED = unique_symbol(symbols, '_console_write_unbuffered')
+    CAVE_LOG, CaveBytes = find_code_cave(data, CAVE_LOG_SIZE + CAVE_CHAR_SIZE + CAVE_DESC_SIZE)
+    CAVE_CHAR = CAVE_LOG + CAVE_LOG_SIZE
+    CAVE_DESC = CAVE_CHAR + CAVE_CHAR_SIZE
+    CAVE_LIMIT = CAVE_LOG + CaveBytes
+    print(f'console caves: {CAVE_LOG:#x}..{CAVE_LIMIT:#x} in __TEXT_EXEC')
 
     # The ring has to live in the kernel image: after arm_vm_init replaces the
     # bootstrap page tables, only the image itself (and the randomised
@@ -299,10 +348,11 @@ def main():
     if struct.unpack_from('<I', data, at)[0] != UNBUFFERED_WORD:
         raise SystemExit(f'console_write_unbuffered does not look as expected at {UNBUFFERED:#x}')
 
-    if not padded_zero(data, CAVE_LOG, 0x100) or not padded_zero(data, CAVE_CHAR, 0x80) \
-            or not padded_zero(data, CAVE_DESC, DESC_SIZE):
-        raise SystemExit('caves are not in zero padding')
-    if CAVE_DESC + DESC_SIZE > CAVE_LIMIT:
+    if not padded_code(data, CAVE_LOG, CAVE_LOG_SIZE) or \
+            not padded_code(data, CAVE_CHAR, CAVE_CHAR_SIZE) or \
+            not padded_code(data, CAVE_DESC, CAVE_DESC_SIZE):
+        raise SystemExit('executable caves are not in zero/NOP padding')
+    if CAVE_DESC + CAVE_DESC_SIZE > CAVE_LIMIT:
         raise SystemExit('cave layout is out of range')
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -311,7 +361,7 @@ def main():
                             {'ring': ring_va, 'resume': CNPUTS + 4})
         char_code = assemble(cave_source(CHAR_SOURCE, ring_data), CAVE_CHAR, work,
                              {'ring': ring_va, 'resume': UNBUFFERED + 4})
-        if len(log_code) > 0x200 or len(char_code) > 0x100:
+        if len(log_code) > CAVE_LOG_SIZE or len(char_code) > CAVE_CHAR_SIZE:
             raise SystemExit('cave does not fit')
 
         data[file_offset(CAVE_LOG):file_offset(CAVE_LOG) + len(log_code)] = log_code

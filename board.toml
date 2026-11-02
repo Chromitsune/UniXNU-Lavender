@@ -46,7 +46,7 @@ darwin_version = "22.6.0"        # Must match the iOS 16.7.16 (20H392) kernelcac
 
 [kernel.prelink]
 tool = "kits/NativePrelink/emit_prelink.py"
-kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf"
+kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped"
 kernelcache_sha256 = "2ec297bac95bcba01046fd0148e97e7e5885c05a6c18827f39f534ba375c1221"
 slide = "-0x1000000"
 # early_security_init: omitted for the iPhone X. The value must point at the
