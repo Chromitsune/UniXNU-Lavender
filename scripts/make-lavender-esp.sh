@@ -12,12 +12,20 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-UNIXNU=${UNIXNU_ROOT:-/Users/rebuke/aOS/UniXNU}
+UNIXNU=${UNIXNU_ROOT:-$ROOT/../UniXNU}
 KERNEL=${1:-$UNIXNU/out/lavender/kernel/kernel.macho}
 PAYLOAD=$UNIXNU/out/lavender/payload/payload.img
 BOOTAA64=${UNIXNU_BOOTAA64:-$UNIXNU/package/Build/Out/AARCH64-DEBUG/UniXNU.efi}
-DARWINBOOT=${UNIXNU_DARWINBOOT:-/Users/rebuke/aOS/edk2-firmware-build/workspace/Build/DarwinBoot/RELEASE_GCC5/AARCH64/DarwinBoot.efi}
-UNIQUE_CHIP_ID=${UNIXNU_UNIQUE_CHIP_ID:-0x1342F1D800000001}
+DARWINBOOT=${UNIXNU_DARWINBOOT:-$ROOT/../edk2-firmware-build/workspace/Build/DarwinBoot/RELEASE_GCC5/AARCH64/DarwinBoot.efi}
+UNIQUE_CHIP_ID=${UNIXNU_UNIQUE_CHIP_ID:-}
+if [ -z "$UNIQUE_CHIP_ID" ]; then
+  echo "set UNIXNU_UNIQUE_CHIP_ID to a stable nonzero 64-bit hex platform ID before building" >&2
+  exit 1
+fi
+if ! grep -aFq 'LAVLOCRINGDESC1' "$KERNEL"; then
+  echo "warning: kernel has no console-ring descriptor; no XNU bootlog will be recovered" >&2
+  echo "         build one with scripts/make-instrumented-kernel.sh and pass that output here" >&2
+fi
 
 for file in "$KERNEL" "$BOOTAA64" "$DARWINBOOT"; do
   if [ ! -f "$file" ]; then

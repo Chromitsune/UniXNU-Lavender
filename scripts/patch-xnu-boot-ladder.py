@@ -11,6 +11,7 @@ Bands are painted top to bottom, so the screen shows exactly how far the kernel
 got. Nothing here changes the original kernel or the boot arguments.
 """
 import argparse
+import os
 import re
 import shutil
 import struct
@@ -126,15 +127,22 @@ def branch(from_va, to_va):
 def assemble(source, va, workdir, symbols):
     asm, obj, elf, binary = (workdir / name for name in ('cave.S', 'cave.o', 'cave.elf', 'cave.bin'))
     asm.write_text(source)
-    clang = '/Users/rebuke/aOS/toolchain/llvm-combined/bin/clang'
-    if not Path(clang).is_file():
-        clang = shutil.which('clang') or '/opt/homebrew/opt/llvm/bin/clang'
-    lld = '/Users/rebuke/aOS/toolchain/llvm-combined/bin/ld.lld'
-    if not Path(lld).is_file():
-        lld = shutil.which('ld.lld') or '/opt/homebrew/opt/llvm/bin/ld.lld'
-    objcopy = '/Users/rebuke/aOS/toolchain/llvm-combined/bin/llvm-objcopy'
-    if not Path(objcopy).is_file():
-        objcopy = shutil.which('llvm-objcopy') or '/opt/homebrew/opt/llvm/bin/llvm-objcopy'
+    tool_dir = Path(os.environ.get('UNIXNU_LLVM_BIN', Path(__file__).resolve().parents[2] / 'toolchain/llvm-combined/bin'))
+
+    def find_tool(name):
+        candidates = [tool_dir / name]
+        located = shutil.which(name)
+        if located:
+            candidates.append(Path(located))
+        candidates.append(Path('/opt/homebrew/opt/llvm/bin') / name)
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+        raise SystemExit(f"missing {name}; install LLVM or set UNIXNU_LLVM_BIN")
+
+    clang = find_tool('clang')
+    lld = find_tool('ld.lld')
+    objcopy = find_tool('llvm-objcopy')
     subprocess.run([clang, '--target=aarch64-none-elf', '-c', asm, '-o', obj], check=True)
     subprocess.run([lld, f'-Ttext={va:#x}', *[f'--defsym={name}={value:#x}' for name, value in symbols.items()],
                     '-e', '_start', obj, '-o', elf], check=True)

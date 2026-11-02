@@ -42,6 +42,37 @@ initrd, entry variables) and the fixture payload already **pass on the device**
    NativeMobileDisplay path), then milestone-2 identity work
    (iPhone9,1 / iOS 15.8, synthetic Home = volume-down + seeded AssistiveTouch)
 
+## Recovering XNU logs over USB
+
+The current lavender kernel has no working USB console. First build and stage
+the instrumented kernel (the ordinary payload build does not add the ring):
+
+```sh
+scripts/make-instrumented-kernel.sh /tmp/lavender-instrumented.macho
+# Set a stable UNIXNU_UNIQUE_CHIP_ID (a nonzero 64-bit hex ID) before creating the ESP:
+scripts/make-lavender-esp.sh /tmp/lavender-instrumented.macho
+```
+
+After XNU fails, hold **Power for more than 10 seconds** to force-restart the
+phone (do not hold a volume button). Release when it restarts, then let it boot
+through UEFI into UniXNU again; DarwinBoot should copy the previous RAM ring to
+`\EFI\UniXNU\bootlog.txt` on the ESP. This is best-effort: a forced reset may
+clear DRAM, so the ring is not guaranteed to survive. Once the archive pass has
+run, boot OrangeFox/recovery (**Volume Up + Power**) and connect the phone over
+USB with recovery ADB enabled. From the host, run:
+
+```sh
+# Optional when more than one ADB device is attached:
+ADB_SERIAL=YOUR_DEVICE_SERIAL scripts/lavender-log-pull-usb.sh [output.txt]
+```
+
+This streams the first 192 MiB of the userdata partition (the ESP) over ADB and
+extracts the boot log. Host requirements: Android platform-tools and `mtools`
+(`brew install mtools` on macOS). If the recovery uses a different userdata
+block path, set `LAVENDER_USERDATA_BLOCK`. A cold power-off can erase the
+RAM-resident ring; first let the UEFI/DarwinBoot pass archive it, then enter
+recovery. This is USB-assisted recovery, **not live XNU-over-USB logging**.
+
 ## Files
 
 ```
@@ -57,8 +88,11 @@ package/unixnu.toml            boot menu entries for the device package (kits/la
 ```sh
 # firmware build (macOS shim toolchain; see ../notes/lavender-port-plan.md)
 #   -> RedmiNote7Pkg -> make-bootimg.py -> fastboot flash boot uefi.img
-# ESP: UniXNU stage-esp with this repo's package/, mformat/mcopy -> flash userdata
-fastboot flash userdata unixnu-esp.img      # retry once — first attempt can fail transiently
+# Flash from Xiaomi ABL/bootloader fastboot, not recovery fastbootd.
+# Vol-Down + Power enters bootloader fastboot; verify userdata is visible first.
+fastboot getvar is-userspace                 # must report no
+fastboot getvar partition-size:userdata     # must report a nonzero size
+fastboot flash userdata unixnu-esp.img      # retry once only for the known transient ABL failure
 fastboot flash boot uefi-boot.img
 fastboot reboot                              # Vol-+Power = fastboot, Vol+Power = OrangeFox safety net
 ```

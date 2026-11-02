@@ -41,12 +41,16 @@ if ! command -v mcopy >/dev/null 2>&1; then
   exit 1
 fi
 
-# The log file, and the file that says where the ring was.
-mcopy -i "$IMAGE" ::/EFI/UniXNU/bootlog.txt "$OUT" 2>/dev/null || true
-if [ ! -s "$OUT" ]; then
-  echo "no bootlog.txt in the image"
+# Extract to a same-directory temporary file: a failed extraction must not
+# leave a stale log from an earlier run looking like a successful recovery.
+TMP_OUT=$(mktemp "${OUT}.tmp.XXXXXX")
+trap 'rm -f "$TMP_OUT"' EXIT
+if ! mcopy -o -i "$IMAGE" ::/EFI/UniXNU/bootlog.txt "$TMP_OUT" 2>/dev/null || [ ! -s "$TMP_OUT" ]; then
+  echo "no bootlog.txt in the image" >&2
   exit 1
 fi
+mv -f "$TMP_OUT" "$OUT"
+trap - EXIT
 
 echo "--- $OUT ($(wc -c < "$OUT") bytes) ---"
 # The log is a byte ring: the newest text is at the end, and the ring can hold

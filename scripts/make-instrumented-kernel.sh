@@ -8,9 +8,9 @@
 # usage: make-instrumented-kernel.sh [output.macho]
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-TREE=${UNIXNU_TREE:-/Users/rebuke/aOS/UniXNU/out/lavender/tree}
+UNIXNU=${UNIXNU_ROOT:-$ROOT/../UniXNU}
 OUT=${1:-/tmp/kernel-instrumented.macho}
-KERNEL=${UNIXNU_KERNEL:-/Users/rebuke/aOS/UniXNU/out/lavender/kernel/kernel.macho}
+KERNEL=${UNIXNU_KERNEL:-$UNIXNU/out/lavender/kernel/kernel.macho}
 
 if [ ! -f "$KERNEL" ]; then
   echo "no built kernel at $KERNEL" >&2

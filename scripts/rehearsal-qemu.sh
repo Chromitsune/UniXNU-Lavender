@@ -10,7 +10,9 @@
 # past the MMU enable needs the QEMU-shaped ADT (make-dt.py) instead.
 set -euo pipefail
 
-PAYLOAD=${1:-/Users/rebuke/aOS/UniXNU/out/lavender/payload/payload.img}
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+UNIXNU=${UNIXNU_ROOT:-$ROOT/../UniXNU}
+PAYLOAD=${1:-$UNIXNU/out/lavender/payload/payload.img}
 DIR=${2:-/tmp/esp-lavender}
 CODE=/opt/homebrew/share/qemu/edk2-aarch64-code.fd
 

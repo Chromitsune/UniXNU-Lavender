@@ -14,16 +14,3 @@ index 60e7e8f..5831a6c 100644
  #ifdef __cplusplus
  extern "C" {
  #endif
-diff --git a/bsd/net/necp_client.c b/bsd/net/necp_client.c
-index 74562d8..c5d1f29 100644
---- a/bsd/net/necp_client.c
-+++ b/bsd/net/necp_client.c
-@@ -68,7 +68,7 @@
- 
- #include <os/refcnt.h>
- 
--#include <CodeSignature/Entitlements.h>
-+#include <CoreEntitlements/CoreEntitlements.h>
- 
- #if SKYWALK
- #include <skywalk/os_skywalk_private.h>

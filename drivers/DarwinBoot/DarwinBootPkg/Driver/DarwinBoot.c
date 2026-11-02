@@ -368,9 +368,10 @@ LogFindRing (
     if (Image[Index] != LOG_DESC_MAGIC[0]) { continue; }
     if (CompareMem (Image + Index, LOG_DESC_MAGIC, sizeof (Desc->Magic)) != 0) { continue; }
     CopyMem (Desc, Image + Index, sizeof (LOG_RING_DESC));
-    if ((Desc->Total <= LOG_RING_HEADER) || (Desc->Data == 0) ||
-        (Desc->Data > Desc->Total - LOG_RING_HEADER) ||
-        ((Desc->Data & (Desc->Data - 1)) != 0)) { return FALSE; }
+    if ((Desc->Total <= LOG_RING_HEADER) || (Desc->Data < 0x1000) ||
+        (Desc->Data != Desc->Total - LOG_RING_HEADER) ||
+        ((Desc->Data & (Desc->Data - 1)) != 0) ||
+        (Desc->Ring > MAX_UINT64 - Desc->Total)) { continue; }
     return TRUE;
   }
   return FALSE;
@@ -396,20 +397,24 @@ LogMapped (
   UINT32                  MapVersion;
   EFI_STATUS              Status;
   UINTN                   Offset;
+  UINT64                  DescriptorEnd;
   BOOLEAN                 Mapped;
 
+  if ((Start == 0) || (End <= Start)) { return FALSE; }
   MapSize = sizeof (MapBuffer);
   Status = gBS->GetMemoryMap (&MapSize, MapBuffer, &MapKey, &MapStride, &MapVersion);
-  if (EFI_ERROR (Status)) { return FALSE; }
+  if (EFI_ERROR (Status) || (MapStride < sizeof (EFI_MEMORY_DESCRIPTOR)) || (MapStride == 0)) { return FALSE; }
   Mapped = FALSE;
   for (Offset = 0; Offset + MapStride <= MapSize; Offset += MapStride) {
     Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)MapBuffer + Offset);
+    if ((Descriptor->NumberOfPages == 0) ||
+        (Descriptor->NumberOfPages > (MAX_UINT64 - Descriptor->PhysicalStart) / EFI_PAGE_SIZE)) { continue; }
+    DescriptorEnd = Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages);
     if (((Descriptor->Type == EfiConventionalMemory) || (Descriptor->Type == EfiLoaderCode) ||
          (Descriptor->Type == EfiLoaderData) || (Descriptor->Type == EfiBootServicesCode) ||
          (Descriptor->Type == EfiBootServicesData) || (Descriptor->Type == EfiRuntimeServicesCode) ||
          (Descriptor->Type == EfiRuntimeServicesData) || (Descriptor->Type == EfiACPIReclaimMemory)) &&
-        (Descriptor->PhysicalStart <= Start) &&
-        (End <= Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages))) {
+        (Descriptor->PhysicalStart <= Start) && (End <= DescriptorEnd)) {
       Mapped = TRUE;
       break;
     }
@@ -438,6 +443,9 @@ LogWriteArchive (
 {
   EFI_FILE_PROTOCOL  *File;
   EFI_STATUS         Status;
+  UINT8              InfoBuffer[sizeof (EFI_FILE_INFO) + 64];
+  EFI_FILE_INFO      *Info;
+  UINTN              InfoSize;
   UINTN              Length;
   UINTN              First;
 
@@ -445,6 +453,19 @@ LogWriteArchive (
   Status = Root->Open (Root, &File, L"\\EFI\\UniXNU\\bootlog.txt",
                        EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
   if (EFI_ERROR (Status)) { return; }
+  // CREATE does not imply truncation for an existing UEFI file. Shrink it
+  // first, or a shorter new log would be followed by stale bytes from last time.
+  Info = (EFI_FILE_INFO *)InfoBuffer;
+  ZeroMem (InfoBuffer, sizeof (InfoBuffer));
+  InfoSize = sizeof (InfoBuffer);
+  Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
+  if (EFI_ERROR (Status) || (Info->Size < sizeof (EFI_FILE_INFO)) || (Info->Size > InfoSize)) {
+    File->Close (File);
+    return;
+  }
+  Info->FileSize = 0;
+  Status = File->SetInfo (File, &gEfiFileInfoGuid, Info->Size, Info);
+  if (EFI_ERROR (Status)) { File->Close (File); return; }
   File->SetPosition (File, 0);
   First = (UINTN)(mLogData - mLogStart);
   if (First > mLogLength) { First = mLogLength; }
@@ -500,7 +521,10 @@ LogReadPrevious (
   Status = File->Read (File, &Size, &Loc);
   if (EFI_ERROR (Status) || (Size != sizeof (Loc))) { goto Done; }
   Ring = Loc.Ring;
-  if ((Loc.Magic != LOG_LOC_MAGIC) || (Ring == 0) || (Loc.Data == 0)) { goto Done; }
+  if ((Loc.Magic != LOG_LOC_MAGIC) || (Loc.Version != LOG_LOC_VERSION) || (Ring == 0) ||
+      (Loc.Data < 0x1000) || (Loc.Data > MAX_UINTN) ||
+      ((Loc.Data & (Loc.Data - 1)) != 0) || (Loc.Data > MAX_UINT64 - LOG_RING_HEADER) ||
+      (Loc.Total != LOG_RING_HEADER + Loc.Data) || (Ring > MAX_UINT64 - Loc.Total)) { goto Done; }
   if (!LogMapped (Ring, Ring + Loc.Total)) { goto Done; }
   mLogData = Loc.Data;
   if (U64 ((VOID *)(UINTN)Ring) != LOG_RING_MAGIC) { goto Done; }
