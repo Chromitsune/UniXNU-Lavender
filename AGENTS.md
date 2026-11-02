@@ -13,6 +13,7 @@ See [`docs/panic-recovery-status.md`](docs/panic-recovery-status.md) for the imp
 
 ## Build and test
 
+- `scripts/make-lavender-esp.sh [kernel.macho]` makes a temporary kernel copy, instruments the RAM ring/panic hook when `panic_recovery = true`, then packages the EFI binaries. It requires the user's private `UNIXNU_UNIQUE_CHIP_ID`; never substitute a guessed ID.
 - `scripts/test-panic-recovery.py --kernel <kernel.macho>` runs host-only BCB/ring contract tests and patches only a temporary kernel copy.
 - `edk2-firmware-build/build-darwinboot.sh darwinboot` builds the EFI driver; it does not flash anything.
 - A full payload build requires the user's private `UNIXNU_UNIQUE_CHIP_ID`; do not invent or commit it.

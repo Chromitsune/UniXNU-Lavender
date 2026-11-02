@@ -22,18 +22,32 @@ if [ -z "$UNIQUE_CHIP_ID" ]; then
   echo "set UNIXNU_UNIQUE_CHIP_ID to a stable nonzero 64-bit hex platform ID before building" >&2
   exit 1
 fi
-if ! grep -aFq 'LAVLOCRINGDESC1' "$KERNEL"; then
-  if python3 - "$ROOT/board.toml" <<'PYCFG'
+KERNEL_INPUT=$KERNEL
+KERNEL_TMP_DIR=
+cleanup_kernel_copy () {
+  if [ -n "$KERNEL_TMP_DIR" ]; then rm -rf "$KERNEL_TMP_DIR"; fi
+}
+trap cleanup_kernel_copy EXIT
+PANIC_RECOVERY=$(python3 - "$ROOT/board.toml" <<'PYCFG'
 import sys, tomllib
 with open(sys.argv[1], 'rb') as f:
-    raise SystemExit(0 if tomllib.load(f).get('payload', {}).get('panic_recovery') else 1)
+    print('1' if tomllib.load(f).get('payload', {}).get('panic_recovery') else '0')
 PYCFG
-  then
-    echo "info: payload build will add the XNU ring and panic-recovery hook to its private kernel copy"
-  else
-    echo "warning: kernel has no console-ring descriptor; no XNU bootlog will be recovered" >&2
-    echo "         build one with scripts/make-instrumented-kernel.sh and pass that output here" >&2
+)
+if [ "$PANIC_RECOVERY" = 1 ]; then
+  KERNEL_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lavender-panic-kernel.XXXXXX")
+  KERNEL=$KERNEL_TMP_DIR/kernel.macho
+  cp "$KERNEL_INPUT" "$KERNEL"
+  if ! grep -aFq 'LAVLOCRINGDESC1' "$KERNEL"; then
+    python3 "$ROOT/scripts/patch-xnu-log-ring.py" "$KERNEL"
   fi
+  if ! grep -aFq 'LAVPANICRECOVERY1' "$KERNEL"; then
+    UNIXNU_UEFI=${UNIXNU_UEFI:-$ROOT/uefi-sheng} \
+      python3 "$ROOT/scripts/patch-xnu-entry-probe.py" "$KERNEL" --panic-screen --panic-screen-only
+  fi
+elif ! grep -aFq 'LAVLOCRINGDESC1' "$KERNEL"; then
+  echo "warning: kernel has no console-ring descriptor; no XNU bootlog will be recovered" >&2
+  echo "         build one with scripts/make-instrumented-kernel.sh or enable panic_recovery in board.toml" >&2
 fi
 
 for file in "$KERNEL" "$BOOTAA64" "$DARWINBOOT"; do
@@ -52,6 +66,17 @@ rm -f out/lavender/payload/payload.img out/lavender/payload/payload.json
 mmd -i "$PAYLOAD" ::/EFI/BOOT
 mcopy -i "$PAYLOAD" "$BOOTAA64" ::/EFI/BOOT/BOOTAA64.EFI
 mcopy -i "$PAYLOAD" "$DARWINBOOT" ::/EFI/UniXNU/Payloads/DarwinBoot.efi
+if [ "$PANIC_RECOVERY" = 1 ]; then
+  python3 - "$UNIXNU/out/lavender/payload/payload.json" "$KERNEL" <<'PYREPORT'
+import hashlib, json, pathlib, sys
+report_path, kernel_path = map(pathlib.Path, sys.argv[1:])
+data = json.loads(report_path.read_text())
+data['panic_recovery'] = True
+data['panic_recovery_kernel_sha256'] = hashlib.sha256(kernel_path.read_bytes()).hexdigest()
+data['hardware_tested'] = False
+report_path.write_text(json.dumps(data, indent=2) + '\n')
+PYREPORT
+fi
 
 echo "--- ESP contents ---"
 mdir -i "$PAYLOAD" ::/EFI/BOOT
