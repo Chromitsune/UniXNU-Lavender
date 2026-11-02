@@ -46,7 +46,13 @@ fi
 TMP_OUT=$(mktemp "${OUT}.tmp.XXXXXX")
 trap 'rm -f "$TMP_OUT"' EXIT
 if ! mcopy -o -i "$IMAGE" ::/EFI/UniXNU/bootlog.txt "$TMP_OUT" 2>/dev/null || [ ! -s "$TMP_OUT" ]; then
-  echo "no bootlog.txt in the image" >&2
+  TMP_LOC=$(mktemp "${OUT}.loc.tmp.XXXXXX")
+  if mcopy -o -i "$IMAGE" ::/EFI/UniXNU/ring.loc "$TMP_LOC" 2>/dev/null && [ -s "$TMP_LOC" ]; then
+    echo "no bootlog.txt; ring.loc exists, but DarwinBoot did not archive the previous RAM ring (or the ring was lost on reset)" >&2
+  else
+    echo "no bootlog.txt or ring.loc; this ESP has no published XNU ring location" >&2
+  fi
+  rm -f "$TMP_LOC"
   exit 1
 fi
 mv -f "$TMP_OUT" "$OUT"
