@@ -4,8 +4,8 @@ Device repository for the **Xiaomi Redmi Note 7** (`lavender`, Qualcomm SDM660)
 on [UniXNU](https://github.com/unixnu/UniXNU) — iOS on a 2019-era Android
 phone, loaded through the phone's own bootloader and storage.
 
-## DISCLAIMER: This is almost fully AI assisted. I am a student and a pretty big beginner in this area, but I can kind of explain what the models I used did. 
-## I just guided the AI, told it my goal, made a small path I thought it should go on, while the AI did almost all the code.
+# DISCLAIMER: This is almost fully AI assisted. I am a student and a pretty big beginner in this area, but I can kind of explain what the models, that I used, did. 
+# I just guided the AI, told it my goal, made a small path I thought it should go on, while the AI did almost all the code.
 
 ## Board realities (all pinned from the phone itself)
 
