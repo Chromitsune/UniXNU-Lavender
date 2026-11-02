@@ -349,6 +349,10 @@ STATIC UINTN   mLogLength;      // bytes of ring data in use
 STATIC UINTN   mLogStart;       // ring offset of the oldest byte
 STATIC UINT64  mLogData;        // the ring's data size, a power of two
 STATIC BOOLEAN mLogPresent;
+STATIC CONST CHAR8 *mLogReadReason;
+STATIC EFI_STATUS mLogArchiveStatus;
+STATIC UINTN mLogArchiveBytes;
+STATIC EFI_STATUS mLogLocationStatus;
 STATIC LOG_RING_DESC mRingDesc;
 
 // Find the ring that the kernel patch put in the image.  The loader cannot
@@ -435,10 +439,11 @@ LogByte (
 // Put the recovered log on the ESP, so it can be read off the phone without
 // booting it.  The ring is circular, so the text is two runs.
 STATIC
-VOID
+EFI_STATUS
 LogWriteArchive (
   EFI_FILE_PROTOCOL  *Root,
-  UINT64             Ring
+  UINT64             Ring,
+  UINTN              *BytesWritten
   )
 {
   EFI_FILE_PROTOCOL  *File;
@@ -448,11 +453,13 @@ LogWriteArchive (
   UINTN              InfoSize;
   UINTN              Length;
   UINTN              First;
+  UINTN              Expected;
 
+  *BytesWritten = 0;
   File = NULL;
   Status = Root->Open (Root, &File, L"\\EFI\\UniXNU\\bootlog.txt",
                        EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
-  if (EFI_ERROR (Status)) { return; }
+  if (EFI_ERROR (Status)) { return Status; }
   // CREATE does not imply truncation for an existing UEFI file. Shrink it
   // first, or a shorter new log would be followed by stale bytes from last time.
   Info = (EFI_FILE_INFO *)InfoBuffer;
@@ -460,22 +467,43 @@ LogWriteArchive (
   InfoSize = sizeof (InfoBuffer);
   Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
   if (EFI_ERROR (Status) || (Info->Size < sizeof (EFI_FILE_INFO)) || (Info->Size > InfoSize)) {
+    if (!EFI_ERROR (Status)) { Status = EFI_COMPROMISED_DATA; }
     File->Close (File);
-    return;
+    return Status;
   }
   Info->FileSize = 0;
   Status = File->SetInfo (File, &gEfiFileInfoGuid, Info->Size, Info);
-  if (EFI_ERROR (Status)) { File->Close (File); return; }
-  File->SetPosition (File, 0);
+  if (EFI_ERROR (Status)) { File->Close (File); return Status; }
+  Status = File->SetPosition (File, 0);
+  if (EFI_ERROR (Status)) { File->Close (File); return Status; }
+
   First = (UINTN)(mLogData - mLogStart);
   if (First > mLogLength) { First = mLogLength; }
-  Length = First;
+  Expected = First;
+  Length = Expected;
   Status = File->Write (File, &Length, (VOID *)(UINTN)(Ring + LOG_RING_HEADER + mLogStart));
-  if (!EFI_ERROR (Status) && (mLogLength > First)) {
-    Length = mLogLength - First;
-    Status = File->Write (File, &Length, (VOID *)(UINTN)(Ring + LOG_RING_HEADER));
+  if (EFI_ERROR (Status) || (Length != Expected)) {
+    if (!EFI_ERROR (Status)) { Status = EFI_DEVICE_ERROR; }
+    File->Close (File);
+    return Status;
   }
-  File->Close (File);
+  *BytesWritten = Length;
+
+  if (mLogLength > First) {
+    Expected = mLogLength - First;
+    Length = Expected;
+    Status = File->Write (File, &Length, (VOID *)(UINTN)(Ring + LOG_RING_HEADER));
+    if (EFI_ERROR (Status) || (Length != Expected)) {
+      if (!EFI_ERROR (Status)) { Status = EFI_DEVICE_ERROR; }
+      File->Close (File);
+      return Status;
+    }
+    *BytesWritten += Length;
+  }
+
+  Status = File->Flush (File);
+  if (EFI_ERROR (Status)) { File->Close (File); return Status; }
+  return File->Close (File);
 }
 
 // Copy the log out of the previous boot's ring and leave it on the ESP.
@@ -507,27 +535,48 @@ LogReadPrevious (
   mLogPresent = FALSE;
   mLogLength = 0;
   mLogStart = 0;
+  mLogReadReason = "ring.loc absent";
+  mLogArchiveStatus = EFI_NOT_FOUND;
+  mLogArchiveBytes = 0;
   File = NULL;
   Status = Root->Open (Root, &File, L"\\EFI\\UniXNU\\ring.loc", EFI_FILE_MODE_READ, 0);
-  if (EFI_ERROR (Status)) { goto Done; }
+  if (EFI_ERROR (Status)) {
+    if (Status != EFI_NOT_FOUND) { mLogReadReason = "ring.loc open failed"; }
+    goto Done;
+  }
   // The file information includes the name, so the buffer has to be larger
   // than the structure itself.
   Info = (EFI_FILE_INFO *)InfoBuffer;
   ZeroMem (InfoBuffer, sizeof (InfoBuffer));
   InfoSize = sizeof (InfoBuffer);
   Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
-  if (EFI_ERROR (Status) || (Info->FileSize < sizeof (LOG_LOC_HEADER))) { goto Done; }
+  if (EFI_ERROR (Status) || (Info->Size > InfoSize) || (Info->FileSize < sizeof (LOG_LOC_HEADER))) {
+    mLogReadReason = EFI_ERROR (Status) ? "ring.loc metadata read failed" : "ring.loc is too small or malformed";
+    goto Done;
+  }
   Size = sizeof (Loc);
   Status = File->Read (File, &Size, &Loc);
-  if (EFI_ERROR (Status) || (Size != sizeof (Loc))) { goto Done; }
+  if (EFI_ERROR (Status) || (Size != sizeof (Loc))) {
+    mLogReadReason = EFI_ERROR (Status) ? "ring.loc read failed" : "ring.loc is truncated";
+    goto Done;
+  }
   Ring = Loc.Ring;
   if ((Loc.Magic != LOG_LOC_MAGIC) || (Loc.Version != LOG_LOC_VERSION) || (Ring == 0) ||
       (Loc.Data < 0x1000) || (Loc.Data > MAX_UINTN) ||
       ((Loc.Data & (Loc.Data - 1)) != 0) || (Loc.Data > MAX_UINT64 - LOG_RING_HEADER) ||
-      (Loc.Total != LOG_RING_HEADER + Loc.Data) || (Ring > MAX_UINT64 - Loc.Total)) { goto Done; }
-  if (!LogMapped (Ring, Ring + Loc.Total)) { goto Done; }
+      (Loc.Total != LOG_RING_HEADER + Loc.Data) || (Ring > MAX_UINT64 - Loc.Total)) {
+    mLogReadReason = "ring.loc geometry is invalid";
+    goto Done;
+  }
+  if (!LogMapped (Ring, Ring + Loc.Total)) {
+    mLogReadReason = "prior ring memory is not mapped; reset may have cleared RAM";
+    goto Done;
+  }
   mLogData = Loc.Data;
-  if (U64 ((VOID *)(UINTN)Ring) != LOG_RING_MAGIC) { goto Done; }
+  if (U64 ((VOID *)(UINTN)Ring) != LOG_RING_MAGIC) {
+    mLogReadReason = "prior ring magic missing; reset may have cleared RAM";
+    goto Done;
+  }
   Total = U64 ((VOID *)(UINTN)(Ring + 8));
   if (Total > mLogData) {
     // The ring has wrapped: the oldest byte is where the counter is now.
@@ -537,8 +586,12 @@ LogReadPrevious (
     mLogStart = 0;
     mLogLength = (UINTN)Total;
   }
-  if (mLogLength == 0) { goto Done; }
+  if (mLogLength == 0) {
+    mLogReadReason = "prior ring was empty";
+    goto Done;
+  }
   mLogPresent = TRUE;
+  mLogReadReason = "prior ring recovered";
   //
   // The tail is all that goes on the screen; the whole log is written to the
   // ESP below, straight out of RAM.
@@ -550,7 +603,10 @@ LogReadPrevious (
     mLogTail[Index] = (CHAR8)Byte;
   }
   mLogTail[Tail] = 0;
-  LogWriteArchive (Root, Ring);
+  mLogArchiveStatus = LogWriteArchive (Root, Ring, &mLogArchiveBytes);
+  if (!EFI_ERROR (mLogArchiveStatus) && (mLogArchiveBytes != mLogLength)) {
+    mLogArchiveStatus = EFI_DEVICE_ERROR;
+  }
 Done:
   if (File != NULL) { File->Close (File); }
   if (!mLogPresent) { mLogTail[0] = 0; }
@@ -559,7 +615,7 @@ Done:
 // Hand the next boot the location of the ring that is about to go live.  Called
 // once the window is known and before the volume is closed.
 STATIC
-VOID
+EFI_STATUS
 LogWriteNext (
   EFI_FILE_PROTOCOL  *Root,
   UINT64             Ring,
@@ -572,7 +628,7 @@ LogWriteNext (
   LOG_LOC_HEADER     Loc;
   UINTN              Length;
 
-  if (Ring == 0) { return; }
+  if (Ring == 0) { return EFI_NOT_FOUND; }
   //
   // The ring belongs to the kernel, which owns the byte counter at +8 and the
   // text at +0x40.  Only the magic at +0 is written here, so that the next
@@ -589,11 +645,19 @@ LogWriteNext (
   File = NULL;
   Status = Root->Open (Root, &File, L"\\EFI\\UniXNU\\ring.loc",
                        EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
-  if (EFI_ERROR (Status)) { return; }
-  File->SetPosition (File, 0);
-  Length = sizeof (Loc);
-  Status = File->Write (File, &Length, (VOID *)&Loc);
-  File->Close (File);
+  if (EFI_ERROR (Status)) { return Status; }
+  Status = File->SetPosition (File, 0);
+  if (!EFI_ERROR (Status)) {
+    Length = sizeof (Loc);
+    Status = File->Write (File, &Length, (VOID *)&Loc);
+    if (!EFI_ERROR (Status) && (Length != sizeof (Loc))) { Status = EFI_DEVICE_ERROR; }
+  }
+  if (!EFI_ERROR (Status)) { Status = File->Flush (File); }
+  {
+    EFI_STATUS CloseStatus = File->Close (File);
+    if (!EFI_ERROR (Status)) { Status = CloseStatus; }
+  }
+  return Status;
 }
 
 // Large diagnostic text straight into the GOP framebuffer: the UEFI text console font is too small to
@@ -854,7 +918,9 @@ Boot (
   // mapped after the kernel replaces its page tables.  Its header goes in
   // after the image is copied, or the copy would wipe it.
   //
-  if (Ring != 0) { LogWriteNext (Root, Address + Ring, RingDesc.Total, RingDesc.Data); }
+  mLogLocationStatus = (Ring != 0)
+      ? LogWriteNext (Root, Address + Ring, RingDesc.Total, RingDesc.Data)
+      : EFI_NOT_FOUND;
   Args = (DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress;
   Args->Revision = 2;
   Args->Version = 2;
@@ -918,8 +984,29 @@ Boot (
   //
   DEBUG ((DEBUG_ERROR, "args virt=0x%lx phys=0x%lx mem=0x%lx top=0x%lx flags=0x%lx\n",
           Args->VirtualBase, Args->PhysicalBase, Args->MemorySize, Args->TopOfKernelData, Args->BootFlags));
-  DEBUG ((DEBUG_ERROR, "log ring 0x%lx  previous log %a (%lu bytes)\n",
-          (Ring != 0) ? Address + Ring : 0, mLogPresent ? "found" : "none", (UINT64)mLogLength));
+  DEBUG ((DEBUG_ERROR, "log ring 0x%lx  previous log %a (%lu bytes) reason=%a\n",
+          (Ring != 0) ? Address + Ring : 0, mLogPresent ? "found" : "none",
+          (UINT64)mLogLength, mLogReadReason));
+  DEBUG ((DEBUG_ERROR, "log archive %a status=%r bytes=%lu/%lu; next locator %a status=%r\n",
+          (mLogPresent && !EFI_ERROR (mLogArchiveStatus) && (mLogArchiveBytes == mLogLength)) ? "SAVED" : "NOT SAVED",
+          mLogArchiveStatus, (UINT64)mLogArchiveBytes, (UINT64)mLogLength,
+          (Ring != 0) ? "written" : "not available", mLogLocationStatus));
+  {
+    CHAR16 LogStatus[96];
+    if (mLogPresent && !EFI_ERROR (mLogArchiveStatus) && (mLogArchiveBytes == mLogLength)) {
+      UnicodeSPrint (LogStatus, sizeof (LogStatus), L"LOG SAVED TO ESP: %lu BYTES", (UINT64)mLogArchiveBytes);
+    } else if (mLogPresent) {
+      UnicodeSPrint (LogStatus, sizeof (LogStatus), L"LOG ARCHIVE FAILED: %r", mLogArchiveStatus);
+    } else {
+      UnicodeSPrint (LogStatus, sizeof (LogStatus), L"NO PRIOR LOG: %a", mLogReadReason);
+    }
+    DiagDraw (LogStatus, 2);
+    if (Ring != 0 && !EFI_ERROR (mLogLocationStatus)) {
+      DiagDraw (L"NEXT CRASH LOG LOCATION SAVED", 3);
+    } else {
+      DiagDraw (L"NEXT CRASH LOG LOCATION FAILED", 3);
+    }
+  }
   DEBUG ((DEBUG_ERROR, "TTBR0_EL1 0x%lx  TTBR1_EL1 0x%lx  sctlr after disable 0x%lx\n",
           READ_SYSREG (ttbr0_el1), READ_SYSREG (ttbr1_el1),
           READ_SYSREG (sctlr_el1) & ~((UINT64)((1 << 0) | (1 << 2) | (1 << 12)))));
