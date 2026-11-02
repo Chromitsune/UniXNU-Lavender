@@ -349,6 +349,7 @@ STATIC UINTN   mLogLength;      // bytes of ring data in use
 STATIC UINTN   mLogStart;       // ring offset of the oldest byte
 STATIC UINT64  mLogData;        // the ring's data size, a power of two
 STATIC BOOLEAN mLogPresent;
+STATIC BOOLEAN mLogLocatorPresent;
 STATIC CONST CHAR8 *mLogReadReason;
 STATIC EFI_STATUS mLogArchiveStatus;
 STATIC UINTN mLogArchiveBytes;
@@ -533,6 +534,7 @@ LogReadPrevious (
   UINTN              Tail;
 
   mLogPresent = FALSE;
+  mLogLocatorPresent = FALSE;
   mLogLength = 0;
   mLogStart = 0;
   mLogReadReason = "ring.loc absent";
@@ -544,6 +546,7 @@ LogReadPrevious (
     if (Status != EFI_NOT_FOUND) { mLogReadReason = "ring.loc open failed"; }
     goto Done;
   }
+  mLogLocatorPresent = TRUE;
   // The file information includes the name, so the buffer has to be larger
   // than the structure itself.
   Info = (EFI_FILE_INFO *)InfoBuffer;
@@ -1006,6 +1009,12 @@ Boot (
     } else {
       DiagDraw (L"NEXT CRASH LOG LOCATION FAILED", 3);
     }
+  }
+  // Make a failed previous-ring recovery visible long enough to read on the
+  // phone; otherwise the next boot's band probes can immediately obscure it.
+  if (mLogLocatorPresent &&
+      (!mLogPresent || EFI_ERROR (mLogArchiveStatus) || (mLogArchiveBytes != mLogLength))) {
+    gBS->Stall (5 * 1000 * 1000);
   }
   DEBUG ((DEBUG_ERROR, "TTBR0_EL1 0x%lx  TTBR1_EL1 0x%lx  sctlr after disable 0x%lx\n",
           READ_SYSREG (ttbr0_el1), READ_SYSREG (ttbr1_el1),
