@@ -23,8 +23,17 @@ if [ -z "$UNIQUE_CHIP_ID" ]; then
   exit 1
 fi
 if ! grep -aFq 'LAVLOCRINGDESC1' "$KERNEL"; then
-  echo "warning: kernel has no console-ring descriptor; no XNU bootlog will be recovered" >&2
-  echo "         build one with scripts/make-instrumented-kernel.sh and pass that output here" >&2
+  if python3 - "$ROOT/board.toml" <<'PYCFG'
+import sys, tomllib
+with open(sys.argv[1], 'rb') as f:
+    raise SystemExit(0 if tomllib.load(f).get('payload', {}).get('panic_recovery') else 1)
+PYCFG
+  then
+    echo "info: payload build will add the XNU ring and panic-recovery hook to its private kernel copy"
+  else
+    echo "warning: kernel has no console-ring descriptor; no XNU bootlog will be recovered" >&2
+    echo "         build one with scripts/make-instrumented-kernel.sh and pass that output here" >&2
+  fi
 fi
 
 for file in "$KERNEL" "$BOOTAA64" "$DARWINBOOT"; do

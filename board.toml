@@ -118,7 +118,8 @@ size_mib = 192
 loader = "payload"                # our phone firmware has no DarwinBoot in its FV: ship the driver on the ESP
 title = "lavender first boot: source 4K XNU to console"
 dram_size = "0xfe4c0000"           # size of the stock FDT memory span (0x80000000..0x17e4c0000), ~3.98 GiB
-panic_screen = false               # patcher offsets assume the full qualified kernel layout (legacy display on); revisit after NativeLegacyDisplay lands
+panic_screen = false
+panic_recovery = true              # dynamic panic-only patch: capture to ring, show 20 s, PSCI SYSTEM_RESET, UEFI archives then requests OF
 # trust_cache_sha256: sha256 of the iPhone X 20H392 StaticTrustCache and
 # Cryptex1,SystemTrustCache members (derived from the IPSW).
 trust_cache_sha256 = [

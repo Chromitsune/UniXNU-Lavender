@@ -13,7 +13,7 @@
 // printf path, the second is the panic log path, which is where a panic
 // message goes.
 //
-// The next boot copies the ring out of RAM and keeps it on the ESP:
+// The next boot attempts to copy the ring out of RAM and keep it on the ESP:
 //
 //   \EFI\UniXNU\ring.loc     where the ring was (the kernel window moves, so
 //                            the address cannot be assumed)
@@ -24,7 +24,7 @@
 //
 
 #define LOG_RING_MAGIC    0x3130474F4C56414CULL   // "LAVLOG01" as stored
-#define LOG_RING_HEADER   0x40ULL                 // magic, total, enabled, pad
+#define LOG_RING_HEADER   0x40ULL                 // magic, cumulative byte counter, reserved
 
 // The descriptor in the kernel image.
 #define LOG_DESC_MAGIC    "LAVLOCRINGDESC1"

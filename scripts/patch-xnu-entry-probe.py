@@ -20,10 +20,12 @@ channels. The stage code lives in the zero padding after the kernel entry
                                         continues. Seeing the bar means the CPU
                                         executed with translation enabled.
   panic screen (--panic-screen)         panic() and its common panic funnel draw
-                                        their format string on the
-                                        kernel's own frame buffer mapping and
-                                        stops (scripts/xnu-panic-screen.c).
-                                        --no-reset leaves out stages 3 and 4.
+                                        formatted diagnostics, append them to
+                                        the kernel ring, wait 20 s, then issue
+                                        PSCI SYSTEM_RESET via SMC. The board
+                                        must provide a ring descriptor.
+                                        --no-reset leaves out stages 3 and 4;
+                                        it does not disable panic recovery.
   stage 4 (--reset-after SYMBOL)        the same wait and reset, but placed after
                                         the call to SYMBOL in --in FUNCTION (the
                                         Nth call, --occurrence). It replaces
@@ -60,6 +62,8 @@ CAVES = {1: 0xFFFFFFF00B9D0500, 2: 0xFFFFFFF00B9D0560, 3: 0xFFFFFFF00B9D05C0, 4:
 STAGE_SIZE = {1: CAVE_SIZE, 2: CAVE_SIZE, 3: CAVE_SIZE, 4: CAVE_SIZE, 5: 0x200}
 TIMEBASE = 19200000
 BOOT_ARGS = 0        # the kernel's copy of the boot arguments (panic screen fallback)
+RING_DESC_MAGIC = b"LAVLOCRINGDESC1\x00"
+RING_HEADER_BYTES = 0x40
 
 PAINT = """
   ldr x1, [{args}, #0x28]
@@ -209,7 +213,7 @@ def find_call(data, symbols, function, name, occurrence):
     return hits[occurrence - 1]
 
 
-def assemble_c(source, va, workdir, symbols):
+def assemble_c(source, va, workdir, symbols, ring=None):
     """Build a freestanding C file for VA; returns (bytes, load address of the first byte, address of panic_screen).
 
     The linker may start .text a little after VA (it keeps the ELF headers in front), so the
@@ -240,6 +244,8 @@ def assemble_c(source, va, workdir, symbols):
     # The kernel's own copy of the boot arguments, used when the video console
     # does not exist yet and the panic screen falls back to the frame buffer.
     boot_args = BOOT_ARGS or symbols.get('_const_boot_args') or 0
+    ring_va, ring_data = ring if ring is not None else (0, 0)
+    definitions.extend((f'-DPANIC_RING={ring_va:#x}UL', f'-DPANIC_RING_DATA={ring_data:#x}UL'))
     subprocess.run([clang, '--target=aarch64-none-elf', '-ffreestanding', '-fno-builtin', '-fno-stack-protector',
                     '-mgeneral-regs-only', '-fno-pic', '-mcmodel=tiny', '-Oz', f'-DVINFO={VINFO_VA:#x}UL',
                     f'-DBOOT_ARGS={boot_args:#x}UL',
@@ -292,6 +298,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 SEGMENTS = []   # (vmaddr, vmsize, fileoff, filesize) of the kernel being patched
+EXEC_SEGMENTS = []  # (vmaddr, vmsize, fileoff, filesize) executable file-backed ranges
 
 
 def load_segments(data):
@@ -301,13 +308,96 @@ def load_segments(data):
         raise SystemExit('Not a 64-bit Mach-O')
     offset = 32
     SEGMENTS.clear()
+    EXEC_SEGMENTS.clear()
     for _ in range(ncmds):
         cmd, size = struct.unpack_from('<II', data, offset)
         if cmd == 0x19:
             _, vmaddr, vmsize, fileoff, filesize = struct.unpack_from('<16sQQQQ', data, offset + 8)
+            initprot = struct.unpack_from('<I', data, offset + 60)[0]
             if filesize:
                 SEGMENTS.append((vmaddr, vmsize, fileoff, filesize))
+                if initprot & 4:
+                    EXEC_SEGMENTS.append((vmaddr, vmsize, fileoff, filesize))
         offset += size
+
+
+def find_ring_descriptor(data):
+    """Return (ring VA, data capacity) from the instrumented kernel descriptor."""
+    offsets = []
+    start = 0
+    while True:
+        at = data.find(RING_DESC_MAGIC, start)
+        if at < 0:
+            break
+        offsets.append(at)
+        start = at + 1
+    if len(offsets) != 1:
+        raise SystemExit(f'panic screen requires one log-ring descriptor; found {len(offsets)}')
+    at = offsets[0]
+    ring, total, capacity, reserved = struct.unpack_from('<QQQQ', data, at + len(RING_DESC_MAGIC))
+    if (reserved != 0 or capacity < 0x1000 or capacity & (capacity - 1) or
+            total != RING_HEADER_BYTES + capacity or ring > (1 << 64) - 1 - total):
+        raise SystemExit('panic screen found malformed log-ring geometry')
+    if not any(base <= ring and ring + total <= base + size for base, size, _, _ in SEGMENTS):
+        raise SystemExit('panic ring does not fit in a kernel segment')
+    return ring, capacity
+
+
+def cave_referenced(data, low, high):
+    """Reject caves targeted by direct branches or ADRP page references."""
+    low_page = low & ~0xFFF
+    high_page = (high + 0xFFF) & ~0xFFF
+    for vmaddr, vmsize, fileoff, filesize in EXEC_SEGMENTS:
+        words = struct.unpack_from('<%dI' % (min(vmsize, filesize) // 4), data, fileoff)
+        for index, word in enumerate(words):
+            pc = vmaddr + index * 4
+            if (word & 0x9F000000) == 0x90000000:  # ADRP
+                imm = (((word >> 5) & 0x7FFFF) << 2) | ((word >> 29) & 3)
+                if imm & (1 << 20): imm -= 1 << 21
+                page = (pc & ~0xFFF) + (imm << 12)
+                if low_page <= page < high_page:
+                    return True
+            # B/BL, B.cond, CBZ/CBNZ and TBZ/TBNZ direct targets.
+            if (word & 0x7C000000) in (0x14000000, 0x94000000):
+                imm = word & 0x3FFFFFF
+                if imm & (1 << 25): imm -= 1 << 26
+                target = pc + (imm << 2)
+            elif (word & 0xFF000010) == 0x54000000 or (word & 0x7E000000) == 0x34000000:
+                imm = (word >> 5) & 0x7FFFF
+                if imm & (1 << 18): imm -= 1 << 19
+                target = pc + (imm << 2)
+            elif (word & 0x7E000000) == 0x36000000:
+                imm = (word >> 5) & 0x3FFF
+                if imm & (1 << 13): imm -= 1 << 14
+                target = pc + (imm << 2)
+            else:
+                continue
+            if low <= target < high:
+                return True
+    return False
+
+
+def find_exec_cave(data, minimum):
+    """Find the largest unreferenced executable file-backed zero/NOP run."""
+    best = None
+    for vmaddr, vmsize, fileoff, filesize in EXEC_SEGMENTS:
+        end = fileoff + min(vmsize, filesize)
+        offset = fileoff
+        while offset + 4 <= end:
+            word = struct.unpack_from('<I', data, offset)[0]
+            if word not in (0, 0xD503201F):
+                offset += 4
+                continue
+            start = offset
+            while offset + 4 <= end and struct.unpack_from('<I', data, offset)[0] in (0, 0xD503201F):
+                offset += 4
+            length = offset - start
+            va = vmaddr + start - fileoff
+            if length >= minimum and not cave_referenced(data, va, va + length) and (best is None or length > best[0]):
+                best = (length, va)
+    if best is None:
+        raise SystemExit(f'no unreferenced executable zero/NOP panic cave of {minimum:#x} bytes')
+    return best[1], best[0]
 
 
 def unixthread_pc(data):
@@ -429,12 +519,15 @@ def padding_extent(data, va):
 
 
 def main():
+    global PANIC_VA, VINFO_VA
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('kernel', type=Path, help='the COPY of the kernel to patch in place')
     parser.add_argument('--reset-delay', type=int, default=6, help='seconds before the reset')
     parser.add_argument('--reset-after', metavar='SYMBOL', help='place the reset after this call in arm_init instead of stage 3')
     parser.add_argument('--reset-before', action='store_true', help='reset at the call site before invoking SYMBOL (requires --reset-after)')
-    parser.add_argument('--panic-screen', action='store_true', help='draw panic() messages on the screen')
+    parser.add_argument('--panic-screen', action='store_true', help='install panic recovery screen and software reset')
+    parser.add_argument('--panic-screen-only', action='store_true',
+                        help='patch only panic recovery; resolve symbols/cave dynamically, no entry-probe offsets')
     parser.add_argument('--no-reset', action='store_true', help='no reset probe at all')
     parser.add_argument('--post-mmu-band', action='store_true',
                         help='paint a white bar just after the MMU is on (drops the MMU at a physical alias to reach the panel)')
@@ -445,27 +538,41 @@ def main():
                         help='the address of the padding the panic screen is placed in')
     parser.add_argument('--in', dest='function', default='_arm_init', help='function that makes the call (default _arm_init)')
     args = parser.parse_args()
+    if args.panic_screen_only and not args.panic_screen:
+        raise SystemExit('--panic-screen-only requires --panic-screen')
+    if args.panic_screen_only and (args.reset_after or args.reset_before or args.post_mmu_band):
+        raise SystemExit('--panic-screen-only cannot be combined with entry reset/band probes')
     if args.reset_before and not args.reset_after:
         raise SystemExit('--reset-before requires --reset-after')
     data = bytearray(args.kernel.read_bytes())
     load_segments(data)
-    kernel_names = rebase(args.kernel, data)
+    if args.panic_screen_only:
+        kernel_names = {name: va for va, name in kernel_symbols(args.kernel).items()}
+        if '_panic' not in kernel_names or '_panic_trap_to_debugger' not in kernel_names:
+            raise SystemExit('panic-only patch requires _panic and _panic_trap_to_debugger symbols')
+        if '_vinfo' not in kernel_names and '_boot_progress_panic_vinfo' not in kernel_names:
+            raise SystemExit('panic-only patch requires a valid _vinfo mapping symbol')
+        PANIC_VA = kernel_names['_panic']
+        VINFO_VA = kernel_names.get('_boot_progress_panic_vinfo', kernel_names.get('_vinfo'))
+    else:
+        kernel_names = rebase(args.kernel, data)
 
     def word(va):
         return struct.unpack_from('<I', data, file_offset(va))[0]
 
-    expected = {ENTRY_VA: branch(ENTRY_VA, START_FIRST_CPU), MMU_ENABLE_VA: 0xD5181000, AFTER_MMU_VA: 0xD2A00600}
-    for va, value in expected.items():
-        if word(va) != value:
-            raise SystemExit(f'{va:#x} holds {word(va):#010x}, expected {value:#010x}: not the kernel these probes are for')
-    for va in CAVES.values():
-        if not padded_clear(data, file_offset(va), CAVE_SIZE):
-            raise SystemExit(f'Padding at {va:#x} is not empty (nor NOP-alignment fill)')
-
-    # (site, cave stage, symbols the cave is linked with)
-    sites = [(ENTRY_VA, 1, {'target': START_FIRST_CPU}),
-             (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4})]
-    if args.no_reset:
+    sites = []
+    if not args.panic_screen_only:
+        expected = {ENTRY_VA: branch(ENTRY_VA, START_FIRST_CPU), MMU_ENABLE_VA: 0xD5181000, AFTER_MMU_VA: 0xD2A00600}
+        for va, value in expected.items():
+            if word(va) != value:
+                raise SystemExit(f'{va:#x} holds {word(va):#010x}, expected {value:#010x}: not the kernel these probes are for')
+        for va in CAVES.values():
+            if not padded_clear(data, file_offset(va), CAVE_SIZE):
+                raise SystemExit(f'Padding at {va:#x} is not empty (nor NOP-alignment fill)')
+        # (site, cave stage, symbols the cave is linked with)
+        sites = [(ENTRY_VA, 1, {'target': START_FIRST_CPU}),
+                 (MMU_ENABLE_VA, 2, {'target': MMU_ENABLE_VA + 4})]
+    if args.no_reset or args.panic_screen_only:
         description = 'no reset probe'
     elif args.reset_after:
         symbols = kernel_symbols(args.kernel)
@@ -501,19 +608,30 @@ def main():
     for site, stage, _ in sites:
         struct.pack_into('<I', data, file_offset(site), branch(site, CAVES[stage]))
     if args.panic_screen:
-        # Right after the last probe cave in use, so the padding is shared as tightly as possible.
-        PANIC_CAVE = max(CAVES[stage] + STAGE_SIZE[stage] for _, stage, _ in sites)
-        panic_limit = PANIC_CAVE_END
+        if b'LAVPANICRECOVERY1' in data:
+            raise SystemExit('panic recovery marker already present; refusing to patch twice')
+        panic_ring = find_ring_descriptor(data)
+        if args.panic_screen_only:
+            PANIC_CAVE, panic_bytes = find_exec_cave(data, 0x400)
+            panic_limit = PANIC_CAVE + panic_bytes
+            panic_cave_bytes = panic_bytes
+        else:
+            # Right after the last probe cave in use, so the padding is shared as tightly as possible.
+            PANIC_CAVE = max(CAVES[stage] + STAGE_SIZE[stage] for _, stage, _ in sites)
+            panic_limit = PANIC_CAVE_END
+            panic_cave_bytes = file_offset(panic_limit) - file_offset(PANIC_CAVE)
         if args.panic_cave:
             # A different kernel has a different padding layout: use the given
             # padding and check it against the space that is actually there.
             cave_start, cave_end = padding_extent(data, args.panic_cave)
             PANIC_CAVE = max(cave_start, args.panic_cave)
             panic_limit = cave_end
-        if word(PANIC_VA) in (0, 0xFFFFFFFF) or not padded_clear(data, file_offset(PANIC_CAVE), file_offset(panic_limit) - file_offset(PANIC_CAVE)):
+            panic_cave_bytes = file_offset(panic_limit - 4) + 4 - file_offset(PANIC_CAVE)
+        if (word(PANIC_VA) in (0, 0xFFFFFFFF) or panic_cave_bytes <= 0 or
+                not padded_clear(data, file_offset(PANIC_CAVE), panic_cave_bytes)):
             raise SystemExit('panic() or the panic screen padding is not as expected')
         with tempfile.TemporaryDirectory() as tmp:
-            code, load, entry = assemble_c(ROOT / 'scripts/xnu-panic-screen.c', PANIC_CAVE, Path(tmp), kernel_names)
+            code, load, entry = assemble_c(ROOT / 'scripts/xnu-panic-screen.c', PANIC_CAVE, Path(tmp), kernel_names, panic_ring)
             common_entry = panic_common_entry(Path(tmp), code, load)
         if load + len(code) > panic_limit:
             raise SystemExit(f'panic screen is {len(code):#x} bytes at {load:#x}, the padding ends at {panic_limit:#x}')
@@ -527,7 +645,7 @@ def main():
         struct.pack_into('<I', data, file_offset(common), branch(common, common_entry))
         description += f', panic screen ({len(code):#x} bytes at {entry:#x}; common funnel at {common:#x})'
     args.kernel.write_bytes(data)
-    print(f'patched {args.kernel.name}: stage 1 blue bar, stage 2 magenta bar, {description}')
+    print(f'patched {args.kernel.name}: {description}')
 
 if __name__ == '__main__':
     main()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Give the kernel a console ring that survives until the next boot.
+"""Give the kernel a console ring that the next boot can harvest if DRAM is retained.
 
 There is no serial console on lavender and the kernel cannot draw after it
 enables the MMU (the panel is outside the bootstrap map).  The one channel that
@@ -13,8 +13,8 @@ works from the first C instruction is memory that the *next* boot can read:
   * a cave on the kernel's _cnputs and on console_write_unbuffered appends
     every console byte to it.  The first is the printf path, the second is the
     panic log path, which is where a panic message goes;
-  * DarwinBoot reads the ring out of RAM on the next boot, prints the tail and
-    keeps the whole log on the ESP.
+  * DarwinBoot attempts to read the ring out of RAM on the next boot, prints
+    the tail and keeps the whole log on the ESP if reset/firmware preserved it.
 
 Nothing here changes the kernel's code or the boot arguments.  The displaced
 instructions are re-executed inside the caves.

@@ -1,4 +1,6 @@
-/* Draw a kernel panic message, with its arguments, on the frame buffer, then stop.
+/* Draw kernel panic diagnostics on the frame buffer, commit them to the RAM
+ * ring, wait about 20 seconds, then issue PSCI SYSTEM_RESET via the SMC conduit.
+ * That reset does not promise DRAM retention across firmware/bootloader startup.
  *
  * Built freestanding by patch-xnu-entry-probe.py and placed in unused padding
  * of a COPY of the kernel; panic() and its common panic funnel are redirected
@@ -33,6 +35,8 @@ struct ctx {
   u32 rb, w, h, x, y;
   u8  *log;   /* kernel buffer that also receives the formatted message (PANIC_TEXT), 0 = none */
   u32 logn;
+  u8  *ring;  /* live kernel ring, linked VA; 0 when not instrumented */
+  u64 ring_data;
 };
 
 #ifndef BOOT_ARGS
@@ -41,7 +45,19 @@ struct ctx {
 #ifndef PANIC_TEXT
 #define PANIC_TEXT 0UL
 #endif
+#ifndef PANIC_RING
+#define PANIC_RING 0UL
+#endif
+#ifndef PANIC_RING_DATA
+#define PANIC_RING_DATA 0UL
+#endif
 #define PANIC_TEXT_BYTES 256
+#define PANIC_RING_HEADER 0x40UL
+__attribute__((used, section(".rodata.panic_recovery")))
+static const char gLavenderPanicRecoveryMarker[] = "LAVPANICRECOVERY1";
+#define PANIC_DISPLAY_SECONDS 20UL
+#define PANIC_FALLBACK_TIMER_HZ 19200000UL
+#define PSCI_SYSTEM_RESET 0x84000009UL
 
 __attribute__((noreturn)) static void park (void)
 {
@@ -50,11 +66,66 @@ __attribute__((noreturn)) static void park (void)
   }
 }
 
+static void clean_ring (struct ctx *g)
+{
+  if (g->ring == 0 || g->ring_data == 0) {
+    __asm__ volatile ("dsb sy" ::: "memory");
+    return;
+  }
+  u64 ctr, line, start, end, address;
+  __asm__ volatile ("mrs %0, ctr_el0" : "=r" (ctr));
+  line = 4UL << ((ctr >> 16) & 0xfUL);
+  start = (u64)g->ring & ~(line - 1);
+  end = ((u64)g->ring + PANIC_RING_HEADER + g->ring_data + line - 1) & ~(line - 1);
+  for (address = start; address < end; address += line) {
+    __asm__ volatile ("dc cvac, %0" :: "r" (address) : "memory");
+  }
+  __asm__ volatile ("dsb sy; isb" ::: "memory");
+}
+
+__attribute__((noreturn)) static void reset_after_display (struct ctx *g)
+{
+  u64 frequency, start, now, ticks;
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (frequency));
+  if (frequency == 0 || frequency > (~0UL / PANIC_DISPLAY_SECONDS)) {
+    frequency = PANIC_FALLBACK_TIMER_HZ;
+  }
+  ticks = frequency * PANIC_DISPLAY_SECONDS;
+  __asm__ volatile ("isb; mrs %0, cntpct_el0" : "=r" (start));
+  do {
+    __asm__ volatile ("yield; isb; mrs %0, cntpct_el0" : "=r" (now));
+  } while ((now - start) < ticks);
+
+  // Include any final concurrent console bytes before the reset request.
+  clean_ring (g);
+  register u64 x0 __asm__ ("x0") = PSCI_SYSTEM_RESET;
+  register u64 x1 __asm__ ("x1") = 0;
+  register u64 x2 __asm__ ("x2") = 0;
+  register u64 x3 __asm__ ("x3") = 0;
+  __asm__ volatile ("smc #0" : "+r" (x0) : "r" (x1), "r" (x2), "r" (x3) : "memory");
+  park ();
+}
+
+static void ring_char (struct ctx *g, u8 c)
+{
+  if (g->ring == 0 || g->ring_data < 0x1000 ||
+      (g->ring_data & (g->ring_data - 1)) != 0) {
+    return;
+  }
+  volatile u64 *counter = (volatile u64 *)(g->ring + 8);
+  u64 total = *counter;
+  volatile u8 *data = g->ring + PANIC_RING_HEADER;
+  data[total & (g->ring_data - 1)] = c;
+  __asm__ volatile ("dmb ishst" ::: "memory");
+  *counter = total + 1;
+}
+
 static void put (struct ctx *g, u8 c)
 {
   const u32 cell = 6 * SCALE, line = 14 * SCALE;
   u32 row, col, dy, dx;
 
+  ring_char (g, c);
   if (g->log && g->logn < PANIC_TEXT_BYTES - 1 && c >= 9 && c <= 126) {
     g->log[g->logn++] = (c < 32) ? ' ' : c;
     g->log[g->logn] = 0;
@@ -258,6 +329,8 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   g.y = g.h / 8;
   g.log = 0;
   g.logn = 0;
+  g.ring = (u8 *)PANIC_RING;
+  g.ring_data = PANIC_RING_DATA;
   for (row = g.y; row < g.h; row++) {
     for (col = 0; col < g.w; col++) {
       *(volatile u32 *)(g.base + (u64)row * g.rb + (u64)col * 4) = 0;
@@ -269,6 +342,15 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   if (PANIC_TEXT && *(volatile u8 *)PANIC_TEXT == 0) {
     g.log = (u8 *)PANIC_TEXT;
   }
+  ring_char (&g, '\n');
+  ring_char (&g, '[');
+  ring_char (&g, 'P');
+  ring_char (&g, 'A');
+  ring_char (&g, 'N');
+  ring_char (&g, 'I');
+  ring_char (&g, 'C');
+  ring_char (&g, ']');
+  ring_char (&g, ' ');
   format (&g, fmt, args);
   g.log = 0;
   __asm__ volatile ("dsb sy");
@@ -290,7 +372,10 @@ __attribute__((noreturn, used, section(".text.b_main"))) void panic_screen_main 
   mark[0] = 0xC0FFEE11u;
   mark[1] = 0x5CEEDA7Au;
   __asm__ volatile ("dsb sy");
-  park ();
+  /* PSCI SYSTEM_RESET is a software-triggered system reset, not a promise that
+   * the platform preserves DRAM. Clean the ring first so a retaining reset has
+   * the best chance of leaving committed bytes visible to UEFI. */
+  reset_after_display (&g);
 }
 
 /* Entry from panic(): keep the stack pointer, which addresses the variadic arguments. */

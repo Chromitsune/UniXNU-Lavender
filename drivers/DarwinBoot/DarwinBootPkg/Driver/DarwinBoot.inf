@@ -14,6 +14,8 @@
   BootVideo.h
   DiagFont.h
   LogRing.h
+  LogRingCore.h
+  RecoveryBcb.h
   Entry.S
 
 [Packages]
@@ -27,6 +29,7 @@
   MemoryAllocationLib
   PrintLib
   UefiBootServicesTableLib
+  UefiRuntimeServicesTableLib
   UefiDriverEntryPoint
   UefiLib
 
@@ -35,6 +38,8 @@
   gEfiSimpleFileSystemProtocolGuid ## CONSUMES
   gEfiLoadedImageProtocolGuid ## CONSUMES
   gEfiGraphicsOutputProtocolGuid ## CONSUMES
+  gEfiBlockIoProtocolGuid ## CONSUMES
+  gEfiPartitionInfoProtocolGuid ## CONSUMES
 
 [Guids]
   gEfiFileInfoGuid

@@ -6,15 +6,20 @@
 #include <Library/DebugLib.h>
 #include <Library/MemoryAllocationLib.h>
 #include <Library/UefiBootServicesTableLib.h>
+#include <Library/UefiRuntimeServicesTableLib.h>
 #include <Library/PrintLib.h>
 #include <Library/UefiLib.h>
 #include <Protocol/UniXNULoader.h>
 #include <Protocol/LoadedImage.h>
 #include <Protocol/GraphicsOutput.h>
+#include <Protocol/BlockIo.h>
+#include <Protocol/PartitionInfo.h>
 #include <Protocol/SimpleFileSystem.h>
 #include "BootArgs.h"
 #include "BootVideo.h"
 #include "LogRing.h"
+#include "LogRingCore.h"
+#include "RecoveryBcb.h"
 #include "PackedRamdisk.h"
 #include "WindowSize.h"
 
@@ -349,7 +354,8 @@ STATIC UINTN   mLogLength;      // bytes of ring data in use
 STATIC UINTN   mLogStart;       // ring offset of the oldest byte
 STATIC UINT64  mLogData;        // the ring's data size, a power of two
 STATIC BOOLEAN mLogPresent;
-STATIC BOOLEAN mLogLocatorPresent;
+STATIC BOOLEAN mLogRecoveryNeeded;
+STATIC BOOLEAN mLogArchiveAttempted;
 STATIC CONST CHAR8 *mLogReadReason;
 STATIC EFI_STATUS mLogArchiveStatus;
 STATIC UINTN mLogArchiveBytes;
@@ -373,7 +379,7 @@ LogFindRing (
     if (Image[Index] != LOG_DESC_MAGIC[0]) { continue; }
     if (CompareMem (Image + Index, LOG_DESC_MAGIC, sizeof (Desc->Magic)) != 0) { continue; }
     CopyMem (Desc, Image + Index, sizeof (LOG_RING_DESC));
-    if ((Desc->Total <= LOG_RING_HEADER) || (Desc->Data < 0x1000) ||
+    if ((Desc->Reserved != 0) || (Desc->Total <= LOG_RING_HEADER) || (Desc->Data < 0x1000) ||
         (Desc->Data != Desc->Total - LOG_RING_HEADER) ||
         ((Desc->Data & (Desc->Data - 1)) != 0) ||
         (Desc->Ring > MAX_UINT64 - Desc->Total)) { continue; }
@@ -382,20 +388,37 @@ LogFindRing (
   return FALSE;
 }
 
-// Is [Start, End) inside one descriptor the firmware will let us read?  A
-// corrupt location file must not send us into a hole or a device window.
-// The map is read into a stack buffer on purpose: this runs before the loader
-// allocates anything, so that the ring is copied out of RAM before a pool
-// allocation can land on it.
+// Is [Start, End) in readable system memory? A corrupt locator must not send
+// us into a hole or a device window. This fixed static buffer avoids allocating
+// memory before the previous ring has been copied out of RAM.
+#define LOG_MAP_DESCRIPTORS 256
+STATIC EFI_MEMORY_DESCRIPTOR mLogMapBuffer[LOG_MAP_DESCRIPTORS];
+
+STATIC
+BOOLEAN
+LogMemoryTypeReadable (
+  UINT32  Type
+  )
+{
+  return (Type == EfiConventionalMemory) || (Type == EfiLoaderCode) ||
+         (Type == EfiLoaderData) || (Type == EfiBootServicesCode) ||
+         (Type == EfiBootServicesData) || (Type == EfiRuntimeServicesCode) ||
+         (Type == EfiRuntimeServicesData) || (Type == EfiACPIReclaimMemory);
+}
+
+// Is [Start, End) in readable system memory? Preserve the failure class so a
+// short memory-map buffer is not misreported as DRAM loss. The static map avoids
+// allocating memory before the previous ring has been copied out.
 STATIC
 BOOLEAN
 LogMapped (
-  UINT64  Start,
-  UINT64  End
+  UINT64        Start,
+  UINT64        End,
+  BOOLEAN       *NeedsReservation,
+  CONST CHAR8   **Reason
   )
 {
   EFI_MEMORY_DESCRIPTOR  *Descriptor;
-  EFI_MEMORY_DESCRIPTOR  MapBuffer[96];
   UINTN                   MapSize;
   UINTN                   MapKey;
   UINTN                   MapStride;
@@ -403,28 +426,82 @@ LogMapped (
   EFI_STATUS              Status;
   UINTN                   Offset;
   UINT64                  DescriptorEnd;
-  BOOLEAN                 Mapped;
+  UINT64                  Cursor;
+  UINT64                  Next;
 
+  *NeedsReservation = FALSE;
+  *Reason = "ring physical range is invalid";
   if ((Start == 0) || (End <= Start)) { return FALSE; }
-  MapSize = sizeof (MapBuffer);
-  Status = gBS->GetMemoryMap (&MapSize, MapBuffer, &MapKey, &MapStride, &MapVersion);
-  if (EFI_ERROR (Status) || (MapStride < sizeof (EFI_MEMORY_DESCRIPTOR)) || (MapStride == 0)) { return FALSE; }
-  Mapped = FALSE;
-  for (Offset = 0; Offset + MapStride <= MapSize; Offset += MapStride) {
-    Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)MapBuffer + Offset);
-    if ((Descriptor->NumberOfPages == 0) ||
-        (Descriptor->NumberOfPages > (MAX_UINT64 - Descriptor->PhysicalStart) / EFI_PAGE_SIZE)) { continue; }
-    DescriptorEnd = Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages);
-    if (((Descriptor->Type == EfiConventionalMemory) || (Descriptor->Type == EfiLoaderCode) ||
-         (Descriptor->Type == EfiLoaderData) || (Descriptor->Type == EfiBootServicesCode) ||
-         (Descriptor->Type == EfiBootServicesData) || (Descriptor->Type == EfiRuntimeServicesCode) ||
-         (Descriptor->Type == EfiRuntimeServicesData) || (Descriptor->Type == EfiACPIReclaimMemory)) &&
-        (Descriptor->PhysicalStart <= Start) && (End <= DescriptorEnd)) {
-      Mapped = TRUE;
-      break;
-    }
+  MapSize = sizeof (mLogMapBuffer);
+  Status = gBS->GetMemoryMap (&MapSize, mLogMapBuffer, &MapKey, &MapStride, &MapVersion);
+  if (Status == EFI_BUFFER_TOO_SMALL) {
+    *Reason = "UEFI memory map exceeds recovery buffer; ring accessibility unknown";
+    return FALSE;
   }
-  return Mapped;
+  if (EFI_ERROR (Status)) {
+    *Reason = "UEFI memory map query failed; ring accessibility unknown";
+    return FALSE;
+  }
+  if ((MapStride < sizeof (EFI_MEMORY_DESCRIPTOR)) || (MapStride == 0) || (MapSize > sizeof (mLogMapBuffer))) {
+    *Reason = "UEFI memory map descriptor format is invalid";
+    return FALSE;
+  }
+
+  // Accept a range covered by adjacent eligible descriptors as well as a
+  // single descriptor; do not require the reset-time map to retain old splits.
+  Cursor = Start;
+  while (Cursor < End) {
+    Next = Cursor;
+    for (Offset = 0; Offset + MapStride <= MapSize; Offset += MapStride) {
+      Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)mLogMapBuffer + Offset);
+      if ((Descriptor->NumberOfPages == 0) ||
+          (Descriptor->NumberOfPages > (MAX_UINT64 - Descriptor->PhysicalStart) / EFI_PAGE_SIZE) ||
+          !LogMemoryTypeReadable (Descriptor->Type) || (Descriptor->PhysicalStart > Cursor)) { continue; }
+      DescriptorEnd = Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages);
+      if (Cursor < DescriptorEnd) {
+        if (Descriptor->Type == EfiConventionalMemory) { *NeedsReservation = TRUE; }
+        if (DescriptorEnd > Next) { Next = (DescriptorEnd < End) ? DescriptorEnd : End; }
+      }
+    }
+    if (Next == Cursor) {
+      *Reason = "no readable UEFI memory-map coverage for prior ring (lost or unavailable)";
+      return FALSE;
+    }
+    Cursor = Next;
+  }
+  return TRUE;
+}
+
+// A prior kernel ring may appear as free conventional memory after reset.
+// Reserve those pages before filesystem writes can allocate over the live ring.
+STATIC
+BOOLEAN
+LogReservePreviousRing (
+  UINT64       Start,
+  UINT64       End,
+  CONST CHAR8  **Reason
+  )
+{
+  EFI_PHYSICAL_ADDRESS  Address;
+  UINT64                PageStart;
+  UINT64                PageEnd;
+  UINTN                 Pages;
+  EFI_STATUS            Status;
+
+  if ((End > MAX_UINT64 - (EFI_PAGE_SIZE - 1)) || (End <= Start)) {
+    *Reason = "prior ring page range overflows";
+    return FALSE;
+  }
+  PageStart = Start & ~((UINT64)EFI_PAGE_SIZE - 1);
+  PageEnd = ALIGN_VALUE (End, EFI_PAGE_SIZE);
+  Pages = (UINTN)((PageEnd - PageStart) / EFI_PAGE_SIZE);
+  Address = PageStart;
+  Status = gBS->AllocatePages (AllocateAddress, EfiLoaderData, Pages, &Address);
+  if (EFI_ERROR (Status) || (Address != PageStart)) {
+    *Reason = "prior ring free pages could not be reserved before archive";
+    return FALSE;
+  }
+  return TRUE;
 }
 
 STATIC
@@ -509,12 +586,14 @@ LogWriteArchive (
 
 // Copy the log out of the previous boot's ring and leave it on the ESP.
 //
-// Only the physical address comes from a file; the bytes come from memory, so
-// this works even when the last boot died before it could write anything.
+// Only the physical address comes from a file; the bytes come from RAM, if
+// reset/firmware startup retained them. A locator alone cannot recover them.
 //
-// Nothing here allocates: the ring is read before the loader asks for the
-// 50 MiB kernel image, because a pool allocation landing on the ring would
-// lose the log.
+// The previous ring is checked before the current kernel is loaded. If the
+// UEFI map calls its pages ConventionalMemory, they are reserved before the
+// archive's filesystem writes. Opening/reading ring.loc itself is firmware I/O
+// and could allocate before its address is known; the reader reports the result
+// rather than claiming that DRAM retention is guaranteed.
 STATIC
 VOID
 LogReadPrevious (
@@ -532,9 +611,11 @@ LogReadPrevious (
   UINT64             Total;
   UINTN              Index;
   UINTN              Tail;
+  BOOLEAN            NeedsReservation;
 
   mLogPresent = FALSE;
-  mLogLocatorPresent = FALSE;
+  mLogRecoveryNeeded = FALSE;
+  mLogArchiveAttempted = FALSE;
   mLogLength = 0;
   mLogStart = 0;
   mLogReadReason = "ring.loc absent";
@@ -546,7 +627,6 @@ LogReadPrevious (
     if (Status != EFI_NOT_FOUND) { mLogReadReason = "ring.loc open failed"; }
     goto Done;
   }
-  mLogLocatorPresent = TRUE;
   // The file information includes the name, so the buffer has to be larger
   // than the structure itself.
   Info = (EFI_FILE_INFO *)InfoBuffer;
@@ -564,34 +644,41 @@ LogReadPrevious (
     goto Done;
   }
   Ring = Loc.Ring;
-  if ((Loc.Magic != LOG_LOC_MAGIC) || (Loc.Version != LOG_LOC_VERSION) || (Ring == 0) ||
-      (Loc.Data < 0x1000) || (Loc.Data > MAX_UINTN) ||
-      ((Loc.Data & (Loc.Data - 1)) != 0) || (Loc.Data > MAX_UINT64 - LOG_RING_HEADER) ||
-      (Loc.Total != LOG_RING_HEADER + Loc.Data) || (Ring > MAX_UINT64 - Loc.Total)) {
+  if (!LogCoreLocatorValid (Loc.Magic, Loc.Version, Loc.Reserved, Ring, Loc.Total, Loc.Data,
+                            LOG_LOC_MAGIC, MAX_UINTN)) {
     mLogReadReason = "ring.loc geometry is invalid";
     goto Done;
   }
-  if (!LogMapped (Ring, Ring + Loc.Total)) {
-    mLogReadReason = "prior ring memory is not mapped; reset may have cleared RAM";
+  if (!LogMapped (Ring, Ring + Loc.Total, &NeedsReservation, &mLogReadReason)) {
+    goto Done;
+  }
+  if (NeedsReservation && !LogReservePreviousRing (Ring, Ring + Loc.Total, &mLogReadReason)) {
     goto Done;
   }
   mLogData = Loc.Data;
   if (U64 ((VOID *)(UINTN)Ring) != LOG_RING_MAGIC) {
-    mLogReadReason = "prior ring magic missing; reset may have cleared RAM";
+    mLogReadReason = "ring magic missing (RAM lost or overwritten)";
     goto Done;
+  }
+  {
+    UINTN HeaderIndex;
+    for (HeaderIndex = 16; HeaderIndex < LOG_RING_HEADER; HeaderIndex++) {
+      if (((UINT8 *)(UINTN)Ring)[HeaderIndex] != 0) {
+        mLogReadReason = "ring reserved header bytes are nonzero (invalid ring data)";
+        goto Done;
+      }
+    }
   }
   Total = U64 ((VOID *)(UINTN)(Ring + 8));
-  if (Total > mLogData) {
-    // The ring has wrapped: the oldest byte is where the counter is now.
-    mLogStart = (UINTN)(Total & (mLogData - 1));
-    mLogLength = (UINTN)mLogData;
-  } else {
-    mLogStart = 0;
-    mLogLength = (UINTN)Total;
-  }
-  if (mLogLength == 0) {
-    mLogReadReason = "prior ring was empty";
-    goto Done;
+  {
+    LOG_CORE_U64 Start;
+    LOG_CORE_U64 Length;
+    if (!LogCoreSpan (Total, mLogData, &Start, &Length)) {
+      mLogReadReason = (Total == 0) ? "ring counter is zero (empty or overwritten)" : "prior ring counter or geometry is invalid";
+      goto Done;
+    }
+    mLogStart = (UINTN)Start;
+    mLogLength = (UINTN)Length;
   }
   mLogPresent = TRUE;
   mLogReadReason = "prior ring recovered";
@@ -606,6 +693,7 @@ LogReadPrevious (
     mLogTail[Index] = (CHAR8)Byte;
   }
   mLogTail[Tail] = 0;
+  mLogArchiveAttempted = TRUE;
   mLogArchiveStatus = LogWriteArchive (Root, Ring, &mLogArchiveBytes);
   if (!EFI_ERROR (mLogArchiveStatus) && (mLogArchiveBytes != mLogLength)) {
     mLogArchiveStatus = EFI_DEVICE_ERROR;
@@ -768,6 +856,106 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   return Status;
 }
 
+// Queue the standard Android recovery bootloader_message in the GPT "misc"
+// partition. This runs only after any recovered ring has been flushed to the
+// ESP. It never touches LOGFS. All device I/O is through discovered UEFI
+// BlockIO/PartitionInfo protocols; no block addresses are assumed.
+STATIC
+EFI_STATUS
+QueueRecoveryBoot (
+  VOID
+  )
+{
+  EFI_HANDLE                    *Handles;
+  UINTN                         HandleCount;
+  UINTN                         Index;
+  EFI_HANDLE                    MiscHandle;
+  EFI_PARTITION_INFO_PROTOCOL   *Partition;
+  EFI_BLOCK_IO_PROTOCOL         *BlockIo;
+  EFI_BLOCK_IO_MEDIA            *Media;
+  EFI_STATUS                    Status;
+  VOID                          *Buffer;
+  UINTN                         Pages;
+  UINTN                         Alignment;
+  UINTN                         Blocks;
+  ANDROID_BOOTLOADER_MESSAGE    *Message;
+
+  Handles = NULL;
+  HandleCount = 0;
+  MiscHandle = NULL;
+  Status = gBS->LocateHandleBuffer (ByProtocol, &gEfiPartitionInfoProtocolGuid,
+                                    NULL, &HandleCount, &Handles);
+  if (EFI_ERROR (Status)) { return Status; }
+  for (Index = 0; Index < HandleCount; Index++) {
+    Partition = NULL;
+    Status = gBS->HandleProtocol (Handles[Index], &gEfiPartitionInfoProtocolGuid, (VOID **)&Partition);
+    if (EFI_ERROR (Status) || (Partition == NULL) || (Partition->Type != PARTITION_TYPE_GPT) ||
+        (StrCmp (Partition->Info.Gpt.PartitionName, L"misc") != 0)) { continue; }
+    if (MiscHandle != NULL) {
+      FreePool (Handles);
+      return EFI_COMPROMISED_DATA;
+    }
+    MiscHandle = Handles[Index];
+  }
+  if (Handles != NULL) { FreePool (Handles); }
+  if (MiscHandle == NULL) { return EFI_NOT_FOUND; }
+
+  BlockIo = NULL;
+  Status = gBS->HandleProtocol (MiscHandle, &gEfiBlockIoProtocolGuid, (VOID **)&BlockIo);
+  if (EFI_ERROR (Status) || (BlockIo == NULL) || (BlockIo->Media == NULL)) { return EFI_ERROR (Status) ? Status : EFI_UNSUPPORTED; }
+  Media = BlockIo->Media;
+  if (Media->ReadOnly) { return EFI_WRITE_PROTECTED; }
+  if ((Media->BlockSize == 0) || (ANDROID_BCB_BYTES % Media->BlockSize != 0) ||
+      (ANDROID_BCB_BYTES < Media->BlockSize) || (BlockIo->FlushBlocks == NULL)) { return EFI_UNSUPPORTED; }
+  Blocks = ANDROID_BCB_BYTES / Media->BlockSize;
+  if ((Blocks == 0) || (Blocks - 1 > Media->LastBlock)) { return EFI_BAD_BUFFER_SIZE; }
+
+  Alignment = MAX (EFI_PAGE_SIZE, Media->IoAlign);
+  if ((Alignment & (Alignment - 1)) != 0) { return EFI_UNSUPPORTED; }
+  Pages = EFI_SIZE_TO_PAGES (ANDROID_BCB_BYTES);
+  Buffer = AllocateAlignedPages (Pages, Alignment);
+  if (Buffer == NULL) { return EFI_OUT_OF_RESOURCES; }
+  Status = BlockIo->ReadBlocks (BlockIo, Media->MediaId, 0, ANDROID_BCB_BYTES, Buffer);
+  if (EFI_ERROR (Status)) { goto Done; }
+  if (!BuildOrangeFoxRecoveryBcb (Buffer, ANDROID_BCB_BYTES)) { Status = EFI_COMPROMISED_DATA; goto Done; }
+  Status = BlockIo->WriteBlocks (BlockIo, Media->MediaId, 0, ANDROID_BCB_BYTES, Buffer);
+  if (EFI_ERROR (Status)) { goto Done; }
+  Status = BlockIo->FlushBlocks (BlockIo);
+  if (EFI_ERROR (Status)) { goto Done; }
+  Status = BlockIo->ReadBlocks (BlockIo, Media->MediaId, 0, ANDROID_BCB_BYTES, Buffer);
+  if (EFI_ERROR (Status)) { goto Done; }
+  Message = (ANDROID_BOOTLOADER_MESSAGE *)Buffer;
+  if ((AsciiStrCmp ((CONST CHAR8 *)Message->Command, "boot-recovery") != 0) ||
+      (AsciiStrCmp ((CONST CHAR8 *)Message->Recovery, "recovery\n--show_text\n") != 0)) {
+    Status = EFI_DEVICE_ERROR;
+  }
+Done:
+  FreeAlignedPages (Buffer, Pages);
+  return Status;
+}
+
+STATIC
+VOID
+LogDrawPriorStatus (
+  VOID
+  )
+{
+  CHAR16 LogStatus[96];
+
+  if (mLogPresent && !EFI_ERROR (mLogArchiveStatus) && (mLogArchiveBytes == mLogLength)) {
+    UnicodeSPrint (LogStatus, sizeof (LogStatus), L"LOG SAVED TO ESP: %lu BYTES", (UINT64)mLogArchiveBytes);
+  } else if (mLogPresent) {
+    UnicodeSPrint (LogStatus, sizeof (LogStatus), L"LOG ARCHIVE FAILED: %r", mLogArchiveStatus);
+  } else {
+    UnicodeSPrint (LogStatus, sizeof (LogStatus), L"NO PRIOR LOG: %a", mLogReadReason);
+  }
+  DiagDraw (LogStatus, 2);
+  if (mLogPresent) {
+    DEBUG ((DEBUG_ERROR, "\n--- previous boot log, %lu bytes ---\n%a\n",
+            (UINT64)mLogLength, mLogTail));
+  }
+}
+
 STATIC
 EFI_STATUS
 EFIAPI
@@ -846,6 +1034,23 @@ Boot (
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
   LogReadPrevious (Root);
+  if (mLogRecoveryNeeded) {
+    // The first UEFI pass after the panic has already attempted the ESP archive.
+    // Stop here rather than immediately booting the same failing XNU again.
+    LogDrawPriorStatus ();
+    DiagDraw (L"QUEUEING ORANGEFOX RECOVERY", 3);
+    Status = QueueRecoveryBoot ();
+    if (EFI_ERROR (Status)) {
+      DEBUG ((DEBUG_ERROR, "DARWINBOOT: recovery BCB write failed: %r\n", Status));
+      DiagDraw (L"RECOVERY REQUEST FAILED; STOPPED", 3);
+      gBS->Stall (20 * 1000 * 1000);
+      CpuDeadLoop ();
+    }
+    DiagDraw (L"RECOVERY REQUEST SAVED; RESETTING", 3);
+    gBS->Stall (1 * 1000 * 1000);
+    gRT->ResetSystem (EfiResetCold, EFI_SUCCESS, 0, NULL);
+    CpuDeadLoop ();
+  }
   Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
   if (EFI_ERROR (Status)) { goto Fail; }
   Status = ParseKernel (Image, ImageSize, &Kernel);
@@ -859,7 +1064,8 @@ Boot (
   Ring = 0;
   if (LogFindRing ((CONST UINT8 *)Image, ImageSize, &RingDesc)) {
     mRingDesc = RingDesc;
-    if ((RingDesc.Ring >= Kernel.Base) && (RingDesc.Ring - Kernel.Base < Kernel.End - Kernel.Base)) {
+    if ((RingDesc.Ring >= Kernel.Base) && (RingDesc.Ring <= Kernel.End) &&
+        (RingDesc.Total <= Kernel.End - RingDesc.Ring)) {
       Ring = RingDesc.Ring - Kernel.Base;   // the offset into the window
     }
   }
@@ -991,8 +1197,10 @@ Boot (
           (Ring != 0) ? Address + Ring : 0, mLogPresent ? "found" : "none",
           (UINT64)mLogLength, mLogReadReason));
   DEBUG ((DEBUG_ERROR, "log archive %a status=%r bytes=%lu/%lu; next locator %a status=%r\n",
-          (mLogPresent && !EFI_ERROR (mLogArchiveStatus) && (mLogArchiveBytes == mLogLength)) ? "SAVED" : "NOT SAVED",
-          mLogArchiveStatus, (UINT64)mLogArchiveBytes, (UINT64)mLogLength,
+          !mLogArchiveAttempted ? "SKIPPED" :
+          ((mLogPresent && !EFI_ERROR (mLogArchiveStatus) && (mLogArchiveBytes == mLogLength)) ? "SAVED" : "FAILED"),
+          mLogArchiveAttempted ? mLogArchiveStatus : EFI_NOT_READY,
+          (UINT64)mLogArchiveBytes, (UINT64)mLogLength,
           (Ring != 0) ? "written" : "not available", mLogLocationStatus));
   {
     CHAR16 LogStatus[96];
@@ -1010,24 +1218,10 @@ Boot (
       DiagDraw (L"NEXT CRASH LOG LOCATION FAILED", 3);
     }
   }
-  // Make a failed previous-ring recovery visible long enough to read on the
-  // phone; otherwise the next boot's band probes can immediately obscure it.
-  if (mLogLocatorPresent &&
-      (!mLogPresent || EFI_ERROR (mLogArchiveStatus) || (mLogArchiveBytes != mLogLength))) {
-    gBS->Stall (5 * 1000 * 1000);
-  }
   DEBUG ((DEBUG_ERROR, "TTBR0_EL1 0x%lx  TTBR1_EL1 0x%lx  sctlr after disable 0x%lx\n",
           READ_SYSREG (ttbr0_el1), READ_SYSREG (ttbr1_el1),
           READ_SYSREG (sctlr_el1) & ~((UINT64)((1 << 0) | (1 << 2) | (1 << 12)))));
   DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmeans the kernel entry code ran.\n"));
-  if (mLogPresent) {
-    //
-    // The log from the last boot.  It is printed last so that it is what stays
-    // on screen: the kernel paints its bands over the top of the display, and
-    // everything below them is what a photograph can still show.
-    //
-    DEBUG ((DEBUG_ERROR, "\n--- previous boot log, %lu bytes ---\n%a\n", (UINT64)mLogLength, mLogTail));
-  }
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
