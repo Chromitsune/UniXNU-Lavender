@@ -31,8 +31,8 @@ set -euo pipefail
 IMAGE=${1:-esp.img}
 OUT=${2:-bootlog.txt}
 case "$OUT" in
-  *.txt) LOC_OUT="${OUT%.txt}.ring.loc" ;;
-  *) LOC_OUT="${OUT}.ring.loc" ;;
+  *.txt) LOC_OUT="${OUT%.txt}.ring.loc"; STATUS_OUT="${OUT%.txt}.status.txt" ;;
+  *) LOC_OUT="${OUT}.ring.loc"; STATUS_OUT="${OUT}.status.txt" ;;
 esac
 
 if [ ! -f "$IMAGE" ]; then
@@ -47,9 +47,24 @@ fi
 
 # Extract to a same-directory temporary file: a failed extraction must not
 # leave a stale log from an earlier run looking like a successful recovery.
+mkdir -p "$(dirname "$OUT")"
+if [ -e "$OUT" ] || [ -e "$LOC_OUT" ] || [ -e "$STATUS_OUT" ]; then
+  echo "refusing to overwrite existing log/diagnostic output; choose a fresh output path" >&2
+  exit 1
+fi
 TMP_OUT=$(mktemp "${OUT}.tmp.XXXXXX")
-rm -f "$LOC_OUT"
 trap 'rm -f "$TMP_OUT"' EXIT
+extract_status() {
+  local tmp_status
+  tmp_status=$(mktemp "${STATUS_OUT}.tmp.XXXXXX")
+  if mcopy -o -i "$IMAGE" ::/EFI/UniXNU/ring-status.txt "$tmp_status" 2>/dev/null && [ -s "$tmp_status" ]; then
+    mv -f "$tmp_status" "$STATUS_OUT"
+    echo "--- $STATUS_OUT ---" >&2
+    cat "$STATUS_OUT" >&2
+  else
+    rm -f "$tmp_status"
+  fi
+}
 if ! mcopy -o -i "$IMAGE" ::/EFI/UniXNU/bootlog.txt "$TMP_OUT" 2>/dev/null || [ ! -s "$TMP_OUT" ]; then
   TMP_LOC=$(mktemp "${OUT}.loc.tmp.XXXXXX")
   if mcopy -o -i "$IMAGE" ::/EFI/UniXNU/ring.loc "$TMP_LOC" 2>/dev/null && [ -s "$TMP_LOC" ]; then
@@ -71,6 +86,7 @@ PYLOC
     rm -f "$TMP_LOC"
     echo "no bootlog.txt or ring.loc; this ESP has no published XNU ring location" >&2
   fi
+  extract_status
   exit 1
 fi
 mv -f "$TMP_OUT" "$OUT"
@@ -81,3 +97,4 @@ echo "--- $OUT ($(wc -c < "$OUT") bytes) ---"
 # bytes that are not text at all.
 LC_ALL=C tr -c '[:print:]\n' '.' < "$OUT" | LC_ALL=C tail -c 4000
 echo
+extract_status

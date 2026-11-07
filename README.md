@@ -78,7 +78,7 @@ recovery. This is USB-assisted recovery, **not live XNU-over-USB logging**. If t
 `scripts/lavender-panic-symbolize.py out/lavender/bootlog.txt`; host-only
 `ipsw-get`/`im4p` helpers adapted from iOSPlus10 are documented in
 [`tools/lavender-image-tools/README.md`](tools/lavender-image-tools/README.md).
-If `bootlog.txt` is absent but `ring.loc` exists, the puller preserves it as an `.ring.loc` sidecar; that locator alone is not the RAM log. The OnePlus USB-ECM logger and Negroni UFS bootlog protocol are not Lavender-compatible.
+If `bootlog.txt` is absent, the puller preserves any `ring.loc` and `ring-status.txt` as `.ring.loc` and `.status.txt` sidecars; a locator alone is not the RAM log. To keep the exact 192 MiB ESP prefix for an offline DarwinBoot-only update, set `LAVENDER_KEEP_ESP=1` and `LAVENDER_ESP_IMAGE=out/lavender/esp-before.img`, then use `scripts/patch-lavender-esp-darwinboot.sh` with a newly built EFI driver. That script validates and preserves `ring.loc` and does not flash. The OnePlus USB-ECM logger and Negroni UFS bootlog protocol are not Lavender-compatible.
 
 ## Files
 

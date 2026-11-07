@@ -356,10 +356,20 @@ STATIC UINT64  mLogData;        // the ring's data size, a power of two
 STATIC BOOLEAN mLogPresent;
 STATIC BOOLEAN mLogRecoveryNeeded;
 STATIC BOOLEAN mLogArchiveAttempted;
+STATIC BOOLEAN mLogLocatorSeen;
+STATIC BOOLEAN mLogLocatorValid;
+STATIC BOOLEAN mLogRingHeaderRead;
+STATIC BOOLEAN mLogCounterRead;
 STATIC CONST CHAR8 *mLogReadReason;
 STATIC EFI_STATUS mLogArchiveStatus;
+STATIC EFI_STATUS mLogRecoveryBcbStatus;
 STATIC UINTN mLogArchiveBytes;
 STATIC EFI_STATUS mLogLocationStatus;
+STATIC UINT64 mLogPreviousRing;
+STATIC UINT64 mLogPreviousTotal;
+STATIC UINT64 mLogPreviousData;
+STATIC UINT64 mLogObservedMagic;
+STATIC UINT64 mLogCounter;
 STATIC LOG_RING_DESC mRingDesc;
 
 // Find the ring that the kernel patch put in the image.  The loader cannot
@@ -584,6 +594,98 @@ LogWriteArchive (
   return File->Close (File);
 }
 
+// Persist the recovery decision independently of the RAM ring. Even when the
+// kernel's magic/counter has been lost, this small record survives on the ESP.
+STATIC
+EFI_STATUS
+LogWriteStatus (
+  EFI_FILE_PROTOCOL  *Root
+  )
+{
+  EFI_FILE_PROTOCOL  *File;
+  EFI_STATUS         Status;
+  EFI_STATUS         CloseStatus;
+  UINT8              InfoBuffer[sizeof (EFI_FILE_INFO) + 64];
+  EFI_FILE_INFO      *Info;
+  UINTN              InfoSize;
+  UINTN              Length;
+  UINTN              Expected;
+  CHAR8              Text[768];
+
+  Length = AsciiSPrint (Text, sizeof (Text),
+                        "LAVENDER_RING_STATUS_V1\n"
+                        "reason=%a\n"
+                        "locator_seen=%u\n"
+                        "locator_valid=%u\n"
+                        "ring=0x%lx\n"
+                        "total=0x%lx\n"
+                        "data=0x%lx\n"
+                        "ring_header_read=%u\n"
+                        "expected_magic=0x%lx\n"
+                        "observed_magic=0x%lx\n"
+                        "counter_read=%u\n"
+                        "counter=0x%lx\n"
+                        "log_present=%u\n"
+                        "archive_attempted=%u\n"
+                        "archive_status=%r\n"
+                        "archive_bytes=%u\n"
+                        "log_bytes=%u\n"
+                        "recovery_required=%u\n"
+                        "recovery_bcb_status=%r\n",
+                        mLogReadReason,
+                        (UINT32)mLogLocatorSeen,
+                        (UINT32)mLogLocatorValid,
+                        mLogPreviousRing,
+                        mLogPreviousTotal,
+                        mLogPreviousData,
+                        (UINT32)mLogRingHeaderRead,
+                        LOG_RING_MAGIC,
+                        mLogObservedMagic,
+                        (UINT32)mLogCounterRead,
+                        mLogCounter,
+                        (UINT32)mLogPresent,
+                        (UINT32)mLogArchiveAttempted,
+                        mLogArchiveStatus,
+                        (UINT32)mLogArchiveBytes,
+                        (UINT32)mLogLength,
+                        (UINT32)mLogRecoveryNeeded,
+                        mLogRecoveryBcbStatus);
+  if ((Length == 0) || (Length >= sizeof (Text))) { return EFI_BUFFER_TOO_SMALL; }
+
+  File = NULL;
+  Status = Root->Open (Root, &File, L"\\EFI\\UniXNU\\ring-status.txt",
+                       EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0);
+  if (EFI_ERROR (Status)) { return Status; }
+
+  Info = (EFI_FILE_INFO *)InfoBuffer;
+  ZeroMem (InfoBuffer, sizeof (InfoBuffer));
+  InfoSize = sizeof (InfoBuffer);
+  Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
+  if (EFI_ERROR (Status) || (Info->Size < sizeof (EFI_FILE_INFO)) || (Info->Size > InfoSize)) {
+    if (!EFI_ERROR (Status)) { Status = EFI_COMPROMISED_DATA; }
+    File->Close (File);
+    return Status;
+  }
+  Info->FileSize = 0;
+  Status = File->SetInfo (File, &gEfiFileInfoGuid, Info->Size, Info);
+  if (EFI_ERROR (Status)) { File->Close (File); return Status; }
+  Status = File->SetPosition (File, 0);
+  if (EFI_ERROR (Status)) { File->Close (File); return Status; }
+
+  Expected = AsciiStrLen (Text);
+  Length = Expected;
+  Status = File->Write (File, &Length, Text);
+  if (EFI_ERROR (Status) || (Length != Expected)) {
+    if (!EFI_ERROR (Status)) { Status = EFI_DEVICE_ERROR; }
+    File->Close (File);
+    return Status;
+  }
+  Status = File->Flush (File);
+  CloseStatus = File->Close (File);
+  if (!EFI_ERROR (Status)) { Status = CloseStatus; }
+  return Status;
+}
+
 // Copy the log out of the previous boot's ring and leave it on the ESP.
 //
 // Only the physical address comes from a file; the bytes come from RAM, if
@@ -616,6 +718,16 @@ LogReadPrevious (
   mLogPresent = FALSE;
   mLogRecoveryNeeded = FALSE;
   mLogArchiveAttempted = FALSE;
+  mLogLocatorSeen = FALSE;
+  mLogLocatorValid = FALSE;
+  mLogRingHeaderRead = FALSE;
+  mLogCounterRead = FALSE;
+  mLogPreviousRing = 0;
+  mLogPreviousTotal = 0;
+  mLogPreviousData = 0;
+  mLogObservedMagic = 0;
+  mLogCounter = 0;
+  mLogRecoveryBcbStatus = EFI_NOT_READY;
   mLogLength = 0;
   mLogStart = 0;
   mLogReadReason = "ring.loc absent";
@@ -624,9 +736,14 @@ LogReadPrevious (
   File = NULL;
   Status = Root->Open (Root, &File, L"\\EFI\\UniXNU\\ring.loc", EFI_FILE_MODE_READ, 0);
   if (EFI_ERROR (Status)) {
-    if (Status != EFI_NOT_FOUND) { mLogReadReason = "ring.loc open failed"; }
+    if (Status != EFI_NOT_FOUND) {
+      mLogReadReason = "ring.loc open failed";
+      mLogRecoveryNeeded = TRUE;
+    }
     goto Done;
   }
+  mLogLocatorSeen = TRUE;
+  mLogRecoveryNeeded = TRUE;
   // The file information includes the name, so the buffer has to be larger
   // than the structure itself.
   Info = (EFI_FILE_INFO *)InfoBuffer;
@@ -644,8 +761,12 @@ LogReadPrevious (
     goto Done;
   }
   Ring = Loc.Ring;
-  if (!LogCoreLocatorValid (Loc.Magic, Loc.Version, Loc.Reserved, Ring, Loc.Total, Loc.Data,
-                            LOG_LOC_MAGIC, MAX_UINTN)) {
+  mLogPreviousRing = Loc.Ring;
+  mLogPreviousTotal = Loc.Total;
+  mLogPreviousData = Loc.Data;
+  mLogLocatorValid = LogCoreLocatorValid (Loc.Magic, Loc.Version, Loc.Reserved, Ring, Loc.Total, Loc.Data,
+                                          LOG_LOC_MAGIC, MAX_UINTN);
+  if (!mLogLocatorValid) {
     mLogReadReason = "ring.loc geometry is invalid";
     goto Done;
   }
@@ -656,7 +777,9 @@ LogReadPrevious (
     goto Done;
   }
   mLogData = Loc.Data;
-  if (U64 ((VOID *)(UINTN)Ring) != LOG_RING_MAGIC) {
+  mLogObservedMagic = U64 ((VOID *)(UINTN)Ring);
+  mLogRingHeaderRead = TRUE;
+  if (mLogObservedMagic != LOG_RING_MAGIC) {
     mLogReadReason = "ring magic missing (RAM lost or overwritten)";
     goto Done;
   }
@@ -670,6 +793,8 @@ LogReadPrevious (
     }
   }
   Total = U64 ((VOID *)(UINTN)(Ring + 8));
+  mLogCounter = Total;
+  mLogCounterRead = TRUE;
   {
     LOG_CORE_U64 Start;
     LOG_CORE_U64 Length;
@@ -1034,12 +1159,20 @@ Boot (
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
   LogReadPrevious (Root);
+  // Record even the "no prior locator" case so a stale status cannot masquerade
+  // as the result of a later boot. The report is tiny and lives on the ESP.
+  Status = LogWriteStatus (Root);
+  if (EFI_ERROR (Status)) { DEBUG ((DEBUG_ERROR, "DARWINBOOT: ring status file write failed: %r\n", Status)); }
   if (mLogRecoveryNeeded) {
-    // The first UEFI pass after the panic has already attempted the ESP archive.
-    // Stop here rather than immediately booting the same failing XNU again.
+    // Stop rather than immediately retrying XNU when a previous locator exists.
     LogDrawPriorStatus ();
     DiagDraw (L"QUEUEING ORANGEFOX RECOVERY", 3);
     Status = QueueRecoveryBoot ();
+    mLogRecoveryBcbStatus = Status;
+    {
+      EFI_STATUS StatusFileStatus = LogWriteStatus (Root);
+      if (EFI_ERROR (StatusFileStatus)) { DEBUG ((DEBUG_ERROR, "DARWINBOOT: ring status update failed: %r\n", StatusFileStatus)); }
+    }
     if (EFI_ERROR (Status)) {
       DEBUG ((DEBUG_ERROR, "DARWINBOOT: recovery BCB write failed: %r\n", Status));
       DiagDraw (L"RECOVERY REQUEST FAILED; STOPPED", 3);

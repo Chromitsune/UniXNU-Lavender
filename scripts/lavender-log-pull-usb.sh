@@ -2,6 +2,7 @@
 # Stream the ESP prefix of userdata over recovery ADB, then extract its log.
 # This is an offline recovery path: XNU itself currently has no USB console.
 set -euo pipefail
+umask 077
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 OUT=${1:-bootlog.txt}
@@ -44,5 +45,16 @@ BYTES=$(wc -c < "$IMAGE" | tr -d ' ')
 if [[ "$BYTES" -ne 201326592 ]]; then
   echo "short USB read: expected 201326592 bytes from userdata, got $BYTES" >&2
   exit 1
+fi
+if [[ "${LAVENDER_KEEP_ESP:-0}" == 1 ]]; then
+  KEEP_IMAGE=${LAVENDER_ESP_IMAGE:-"$ROOT/out/lavender/userdata-prefix.img"}
+  mkdir -p "$(dirname "$KEEP_IMAGE")"
+  if [[ -e "$KEEP_IMAGE" ]]; then
+    echo "refusing to overwrite existing local ESP image: $KEEP_IMAGE" >&2
+    exit 1
+  fi
+  mv "$IMAGE" "$KEEP_IMAGE"
+  IMAGE=$KEEP_IMAGE
+  echo "saved protected local ESP prefix ($BYTES bytes): $IMAGE" >&2
 fi
 "$ROOT/scripts/lavender-log-pull.sh" "$IMAGE" "$OUT"

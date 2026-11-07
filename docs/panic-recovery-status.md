@@ -61,3 +61,15 @@ The user explicitly authorized flashing on 2026-11-01. To preserve the existing 
 - After the owner placed the phone in recovery, ADB identified one Lavender device. `scripts/lavender-log-pull-usb.sh out/lavender/bootlog.txt` read the first 192 MiB of `userdata` (read-only). No `bootlog.txt` was present; `ring.loc` was preserved as `out/lavender/bootlog.ring.loc`.
 - The 40-byte locator validates: magic/version/reserved fields are correct, ring address `0xEBEADF00`, total `0x10040`, data capacity `0x10000` (64 KiB). This confirms the locator persisted on the ESP. It does **not** prove that RAM survived the reset or that DarwinBoot read the ring; the ring bytes are not in `ring.loc`.
 - No device reset, flash, partition write, or raw-memory read was performed. The missing `bootlog.txt` leaves the archive failure cause unresolved; the exact UEFI recovery-screen status was not captured.
+
+
+### Ring-status persistence follow-up
+
+The owner recalled the UEFI screen saying `ring magic missing (RAM lost or overwritten)`, not `ring counter is zero`. This is the `LogReadPrevious` branch after a valid locator and memory-range check: the bytes at the locator address did not contain `LOG_RING_MAGIC`. It is consistent with RAM being lost or reused, but does not identify which stage caused it. The updated DarwinBoot writes a `ring-status.txt` record to the ESP on every UEFI pass and rewrites it with the BCB result when a prior locator triggers recovery; this preserves the failure reason but cannot reconstruct the missing RAM log. A prior `ring.loc` now also activates the intended recovery route (the previous source never set `mLogRecoveryNeeded`).
+
+
+### Status-file implementation and build
+
+- DarwinBoot now treats any prior `ring.loc` as requiring the recovery path (the previous source left `mLogRecoveryNeeded` unset), writes a flushed `ring-status.txt` before the BCB operation, then rewrites it with the BCB result. It records locator validity, expected/observed ring magic, counter if readable, archive status, and recovery status.
+- `scripts/patch-lavender-esp-darwinboot.sh` updates only `EFI/UniXNU/Payloads/DarwinBoot.efi` in a captured 192 MiB ESP image and verifies the original `ring.loc` is byte-identical. It does not flash.
+- The updated RELEASE DarwinBoot EFI build completed successfully (57,344 bytes). A synthetic FAT ESP test of the offline patcher and the offline log/status extractor passed. No new payload was flashed; the target disappeared from both ADB and fastboot after the recovery pull, so the device deployment/test remains pending.
