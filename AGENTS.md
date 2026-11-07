@@ -17,3 +17,9 @@ See [`docs/panic-recovery-status.md`](docs/panic-recovery-status.md) for the imp
 - `scripts/test-panic-recovery.py --kernel <kernel.macho>` runs host-only BCB/ring contract tests and patches only a temporary kernel copy.
 - `edk2-firmware-build/build-darwinboot.sh darwinboot` builds the EFI driver; it does not flash anything.
 - A full payload build requires the user's private `UNIXNU_UNIQUE_CHIP_ID`; do not invent or commit it.
+
+## Host logging and image utilities
+
+- After recovery ADB is available, `scripts/lavender-log-pull-usb.sh out/lavender/bootlog.txt` reads the ESP prefix only; it never writes to the phone. Symbolize a retrieved log with `scripts/lavender-panic-symbolize.py` and the exact matching kernel (`--kernel` or `UNIXNU_KERNEL`).
+- Lavender does not implement the Negroni CDC-ECM log/UDP command service or its persistent UFS bootlog. Do not run iOSPlus10 `ctl`, `bootlog`, or `flash` commands on this device.
+- `tools/lavender-image-tools/` contains only host-side IPSW/IM4P helpers. It does not flash or access devices; run `scripts/test-lavender-image-tools.sh` for its local tests.

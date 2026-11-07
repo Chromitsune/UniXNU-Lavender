@@ -46,3 +46,11 @@ The user explicitly authorized flashing on 2026-11-01. To preserve the existing 
 
 - `fastboot flash userdata payload-panic-recovery.img` completed successfully (192 MiB sent/written), then `fastboot reboot` returned OKAY.
 - After a 60-second delay, neither ADB nor fastboot enumerated the phone. No screen observation, UEFI status, OrangeFox session, or `bootlog.txt` was available to us. This is **inconclusive**: it does not prove the reset failed, the ring was lost, or that OF was reached. Do not force another reset until the user can inspect the screen/state.
+
+
+### 2026-11-06 read-only log retrieval attempt
+
+- Host enumeration found the device in Xiaomi ABL fastboot (`product: lavender`); ADB listed no devices. Read-only `fastboot getvar` showed the existing `userdata` partition size and unlocked state.
+- `scripts/lavender-log-pull-usb.sh out/lavender/bootlog.txt` stopped before reading because no usable ADB recovery session was present. No reboot, reset, flash, or partition write was issued.
+- No local `bootlog.txt` was found. The safe next step is for the owner to inspect the screen and put the phone into OrangeFox/recovery with ADB enabled; then the pull script reads only the first 192 MiB of `userdata` and extracts the ESP log.
+- The iOSPlus10 live UDP logger, `ctl`, and persistent UFS bootlog are Negroni-specific and were not transplanted. A host-only panic symbolizer and generic IPSW/IM4P helpers were added instead.

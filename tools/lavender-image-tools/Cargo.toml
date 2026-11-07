@@ -1,0 +1,17 @@
+[package]
+name = "lavender-image-tools"
+version = "0.1.0"
+edition = "2021"
+description = "Host-side IPSW member and IM4P tools for UniXNU-Lavender"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crc32fast = "1"
+flate2 = "1"
+lzfse_rust = "0.2"
+rayon = "1.12.0"
+simple_asn1 = "0.6.4"
+ureq = "2"
+zip = { version = "9.1.0", default-features = false, features = ["deflate-flate2"] }

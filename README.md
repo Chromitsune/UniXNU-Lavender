@@ -73,7 +73,12 @@ extracts the boot log. Host requirements: Android platform-tools and `mtools`
 (`brew install mtools` on macOS). If the recovery uses a different userdata
 block path, set `LAVENDER_USERDATA_BLOCK`. A cold power-off can erase the
 RAM-resident ring; first let the UEFI/DarwinBoot pass archive it, then enter
-recovery. This is USB-assisted recovery, **not live XNU-over-USB logging**.
+recovery. This is USB-assisted recovery, **not live XNU-over-USB logging**. If the pull yields
+`bootlog.txt`, symbolize it against the exact kernel build with
+`scripts/lavender-panic-symbolize.py out/lavender/bootlog.txt`; host-only
+`ipsw-get`/`im4p` helpers adapted from iOSPlus10 are documented in
+[`tools/lavender-image-tools/README.md`](tools/lavender-image-tools/README.md).
+The OnePlus USB-ECM logger and Negroni UFS bootlog protocol are not Lavender-compatible.
 
 ## Files
 
