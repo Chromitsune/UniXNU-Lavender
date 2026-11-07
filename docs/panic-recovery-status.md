@@ -54,3 +54,10 @@ The user explicitly authorized flashing on 2026-11-01. To preserve the existing 
 - `scripts/lavender-log-pull-usb.sh out/lavender/bootlog.txt` stopped before reading because no usable ADB recovery session was present. No reboot, reset, flash, or partition write was issued.
 - No local `bootlog.txt` was found. The safe next step is for the owner to inspect the screen and put the phone into OrangeFox/recovery with ADB enabled; then the pull script reads only the first 192 MiB of `userdata` and extracts the ESP log.
 - The iOSPlus10 live UDP logger, `ctl`, and persistent UFS bootlog are Negroni-specific and were not transplanted. A host-only panic symbolizer and generic IPSW/IM4P helpers were added instead.
+
+
+### 2026-11-07 OrangeFox log pull
+
+- After the owner placed the phone in recovery, ADB identified one Lavender device. `scripts/lavender-log-pull-usb.sh out/lavender/bootlog.txt` read the first 192 MiB of `userdata` (read-only). No `bootlog.txt` was present; `ring.loc` was preserved as `out/lavender/bootlog.ring.loc`.
+- The 40-byte locator validates: magic/version/reserved fields are correct, ring address `0xEBEADF00`, total `0x10040`, data capacity `0x10000` (64 KiB). This confirms the locator persisted on the ESP. It does **not** prove that RAM survived the reset or that DarwinBoot read the ring; the ring bytes are not in `ring.loc`.
+- No device reset, flash, partition write, or raw-memory read was performed. The missing `bootlog.txt` leaves the archive failure cause unresolved; the exact UEFI recovery-screen status was not captured.

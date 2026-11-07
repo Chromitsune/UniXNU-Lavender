@@ -30,6 +30,10 @@ set -euo pipefail
 
 IMAGE=${1:-esp.img}
 OUT=${2:-bootlog.txt}
+case "$OUT" in
+  *.txt) LOC_OUT="${OUT%.txt}.ring.loc" ;;
+  *) LOC_OUT="${OUT}.ring.loc" ;;
+esac
 
 if [ ! -f "$IMAGE" ]; then
   echo "usage: $0 <esp image from the phone> [output]" >&2
@@ -44,15 +48,29 @@ fi
 # Extract to a same-directory temporary file: a failed extraction must not
 # leave a stale log from an earlier run looking like a successful recovery.
 TMP_OUT=$(mktemp "${OUT}.tmp.XXXXXX")
+rm -f "$LOC_OUT"
 trap 'rm -f "$TMP_OUT"' EXIT
 if ! mcopy -o -i "$IMAGE" ::/EFI/UniXNU/bootlog.txt "$TMP_OUT" 2>/dev/null || [ ! -s "$TMP_OUT" ]; then
   TMP_LOC=$(mktemp "${OUT}.loc.tmp.XXXXXX")
   if mcopy -o -i "$IMAGE" ::/EFI/UniXNU/ring.loc "$TMP_LOC" 2>/dev/null && [ -s "$TMP_LOC" ]; then
-    echo "no bootlog.txt; ring.loc exists, but DarwinBoot did not archive the previous RAM ring (or the ring was lost on reset)" >&2
+    mv -f "$TMP_LOC" "$LOC_OUT"
+    echo "no bootlog.txt; preserved ring locator at $LOC_OUT" >&2
+    python3 - "$LOC_OUT" <<'PYLOC'
+import struct, sys
+b = open(sys.argv[1], 'rb').read()
+if len(b) < 40:
+    print(f"ring.loc: truncated ({len(b)} bytes; expected 40)", file=sys.stderr)
+    raise SystemExit(1)
+magic, version, reserved, ring, total, data = struct.unpack_from('<QIIQQQ', b)
+valid = (magic == 0x314C4F56414C414C and version == 1 and reserved == 0 and ring != 0
+         and data >= 0x1000 and data & (data - 1) == 0 and total == 0x40 + data)
+print(f"ring.loc: bytes={len(b)} version={version} valid={valid} ring={ring:#x} total={total:#x} data={data:#x}", file=sys.stderr)
+PYLOC
+    echo "DarwinBoot did not publish bootlog.txt; locator alone cannot recover the RAM ring after reset." >&2
   else
+    rm -f "$TMP_LOC"
     echo "no bootlog.txt or ring.loc; this ESP has no published XNU ring location" >&2
   fi
-  rm -f "$TMP_LOC"
   exit 1
 fi
 mv -f "$TMP_OUT" "$OUT"
